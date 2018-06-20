@@ -33,28 +33,27 @@
 
 using System;
 using System.Runtime.CompilerServices;
-using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 	
 namespace Mono.CompilerServices.SymbolWriter
 {
 	public class MonoSymbolWriter
 	{
-		ArrayList methods = null;
-		ArrayList sources = null;
-		ArrayList comp_units = null;
+		List<SourceMethodBuilder> methods;
+		List<SourceFileEntry> sources;
+		List<CompileUnitEntry> comp_units;
 		protected readonly MonoSymbolFile file;
-		string filename = null;
+		string filename;
 		
-		private SourceMethodBuilder current_method = null;
-		private Stack current_method_stack;
+		private SourceMethodBuilder current_method;
+		Stack<SourceMethodBuilder> current_method_stack = new Stack<SourceMethodBuilder> ();
 
 		public MonoSymbolWriter (string filename)
 		{
-			this.methods = new ArrayList ();
-			this.sources = new ArrayList ();
-			this.comp_units = new ArrayList ();
-			this.current_method_stack = new Stack ();
+			this.methods = new List<SourceMethodBuilder> ();
+			this.sources = new List<SourceFileEntry> ();
+			this.comp_units = new List<CompileUnitEntry> ();
 			this.file = new MonoSymbolFile ();
 
 			this.filename = filename + ".mdb";
@@ -234,157 +233,6 @@ namespace Mono.CompilerServices.SymbolWriter
 			using (FileStream fs = new FileStream (filename, FileMode.Create, FileAccess.Write)) {
 				file.CreateSymbolFile (guid, fs);
 			}
-		}
-	}
-
-	public class SourceMethodBuilder
-	{
-		ArrayList _locals;
-		ArrayList _blocks;
-		ArrayList _scope_vars;
-		Stack _block_stack;
-		string _real_name;
-		IMethodDef _method;
-		ICompileUnit _comp_unit;
-//		MethodEntry.Flags _method_flags;
-		int _ns_id;
-
-		public SourceMethodBuilder (ICompileUnit comp_unit, int ns_id, IMethodDef method)
-		{
-			this._comp_unit = comp_unit;
-			this._method = method;
-			this._ns_id = ns_id;
-
-			method_lines = new LineNumberEntry [32];
-		}
-
-		private LineNumberEntry [] method_lines;
-		private int method_lines_pos = 0;
-
-		public void MarkSequencePoint (int offset, SourceFileEntry file, int line, int column,
-					       bool is_hidden)
-		{
-			if (method_lines_pos == method_lines.Length) {
-				LineNumberEntry [] tmp = method_lines;
-				method_lines = new LineNumberEntry [method_lines.Length * 2];
-				Array.Copy (tmp, method_lines, method_lines_pos);
-			}
-
-			int file_idx = file != null ? file.Index : 0;
-			method_lines [method_lines_pos++] = new LineNumberEntry (
-				file_idx, line, offset, is_hidden);
-		}
-
-		public void StartBlock (CodeBlockEntry.Type type, int start_offset)
-		{
-			if (_block_stack == null)
-				_block_stack = new Stack ();
-			if (_blocks == null)
-				_blocks = new ArrayList ();
-
-			int parent = CurrentBlock != null ? CurrentBlock.Index : -1;
-
-			CodeBlockEntry block = new CodeBlockEntry (
-				_blocks.Count + 1, parent, type, start_offset);
-
-			_block_stack.Push (block);
-			_blocks.Add (block);
-		}
-
-		public void EndBlock (int end_offset)
-		{
-			CodeBlockEntry block = (CodeBlockEntry) _block_stack.Pop ();
-			block.Close (end_offset);
-		}
-
-		public CodeBlockEntry[] Blocks {
-			get {
-				if (_blocks == null)
-					return new CodeBlockEntry [0];
-
-				CodeBlockEntry[] retval = new CodeBlockEntry [_blocks.Count];
-				_blocks.CopyTo (retval, 0);
-				return retval;
-			}
-		}
-
-		public CodeBlockEntry CurrentBlock {
-			get {
-				if ((_block_stack != null) && (_block_stack.Count > 0))
-					return (CodeBlockEntry) _block_stack.Peek ();
-				else
-					return null;
-			}
-		}
-
-		public LocalVariableEntry[] Locals {
-			get {
-				if (_locals == null)
-					return new LocalVariableEntry [0];
-				else {
-					LocalVariableEntry[] retval =
-						new LocalVariableEntry [_locals.Count];
-					_locals.CopyTo (retval, 0);
-					return retval;
-				}
-			}
-		}
-
-		public void AddLocal (int index, string name)
-		{
-			if (_locals == null)
-				_locals = new ArrayList ();
-			int block_idx = CurrentBlock != null ? CurrentBlock.Index : 0;
-			_locals.Add (new LocalVariableEntry (index, name, block_idx));
-		}
-
-		public ScopeVariable[] ScopeVariables {
-			get {
-				if (_scope_vars == null)
-					return new ScopeVariable [0];
-
-				ScopeVariable[] retval = new ScopeVariable [_scope_vars.Count];
-				_scope_vars.CopyTo (retval);
-				return retval;
-			}
-		}
-
-		public void AddScopeVariable (int scope, int index)
-		{
-			if (_scope_vars == null)
-				_scope_vars = new ArrayList ();
-			_scope_vars.Add (
-				new ScopeVariable (scope, index));
-		}
-
-		public string RealMethodName {
-			get { return _real_name; }
-		}
-
-		public void SetRealMethodName (string name)
-		{
-			_real_name = name;
-		}
-
-		public ICompileUnit SourceFile {
-			get { return _comp_unit; }
-		}
-
-		public IMethodDef Method {
-			get { return _method; }
-		}
-
-		public void DefineMethod (MonoSymbolFile file)
-		{
-			LineNumberEntry[] lines = new LineNumberEntry [method_lines_pos];
-			Array.Copy (method_lines, lines, method_lines_pos);
-
-			MethodEntry entry = new MethodEntry (
-				file, _comp_unit.Entry, _method.Token, ScopeVariables,
-				Locals, lines, Blocks, RealMethodName, 0, //_method_flags,
-				_ns_id);
-
-			file.AddMethod (entry);
 		}
 	}
 }

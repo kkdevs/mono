@@ -1,62 +1,46 @@
 //
 // statement.cs: Statement representation for the IL tree.
 //
-// Author:
+// Authors:
 //   Miguel de Icaza (miguel@ximian.com)
 //   Martin Baulig (martin@ximian.com)
-//   Marek Safar (marek.safar@seznam.cz)
+//   Marek Safar (marek.safar@gmail.com)
 //
 // Copyright 2001, 2002, 2003 Ximian, Inc.
 // Copyright 2003, 2004 Novell, Inc.
+// Copyright 2011 Xamarin Inc.
 //
 
 using System;
-using System.Text;
-using System.Reflection;
+using System.Collections.Generic;
+
+#if STATIC
+using IKVM.Reflection.Emit;
+#else
 using System.Reflection.Emit;
-using System.Diagnostics;
-using System.Collections;
-using System.Collections.Specialized;
+#endif
 
 namespace Mono.CSharp {
 	
 	public abstract class Statement {
 		public Location loc;
+		protected bool reachable;
+
+		public bool IsUnreachable {
+			get {
+				return !reachable;
+			}
+		}
 		
 		/// <summary>
 		///   Resolves the statement, true means that all sub-statements
 		///   did resolve ok.
-		//  </summary>
-		public virtual bool Resolve (BlockContext ec)
+		///  </summary>
+		public virtual bool Resolve (BlockContext bc)
 		{
 			return true;
 		}
 
-		/// <summary>
-		///   We already know that the statement is unreachable, but we still
-		///   need to resolve it to catch errors.
-		/// </summary>
-		public virtual bool ResolveUnreachable (BlockContext ec, bool warn)
-		{
-			//
-			// This conflicts with csc's way of doing this, but IMHO it's
-			// the right thing to do.
-			//
-			// If something is unreachable, we still check whether it's
-			// correct.  This means that you cannot use unassigned variables
-			// in unreachable code, for instance.
-			//
-
-			if (warn)
-				ec.Report.Warning (162, 2, loc, "Unreachable code detected");
-
-			ec.StartFlowBranching (FlowBranching.BranchingType.Block, loc);
-			bool ok = Resolve (ec);
-			ec.KillFlowBranching ();
-
-			return ok;
-		}
-				
 		/// <summary>
 		///   Return value indicates whether all code paths emitted return.
 		/// </summary>
@@ -66,6 +50,10 @@ namespace Mono.CSharp {
 		{
 			ec.Mark (loc);
 			DoEmit (ec);
+
+			if (ec.StatementEpilogue != null) {
+				ec.EmitEpilogue ();
+			}
 		}
 
 		//
@@ -86,146 +74,154 @@ namespace Mono.CSharp {
 			ec.Report.Error (834, loc, "A lambda expression with statement body cannot be converted to an expresion tree");
 			return null;
 		}
-
-		public Statement PerformClone ()
+		
+		public virtual object Accept (StructuralVisitor visitor)
 		{
-			CloneContext clonectx = new CloneContext ();
-
-			return Clone (clonectx);
+			return visitor.Visit (this);
 		}
 
-		public abstract void MutateHoistedGenericType (AnonymousMethodStorey storey);
+		//
+		// Return value indicates whether statement has unreachable end
+		//
+		protected abstract bool DoFlowAnalysis (FlowAnalysisContext fc);
+
+		public bool FlowAnalysis (FlowAnalysisContext fc)
+		{
+			if (reachable) {
+				fc.UnreachableReported = false;
+				var res = DoFlowAnalysis (fc);
+				return res;
+			}
+
+			//
+			// Special handling cases
+			//
+			if (this is Block) {
+				return DoFlowAnalysis (fc);
+			}
+
+			if (this is EmptyStatement || loc.IsNull)
+				return true;
+
+			if (fc.UnreachableReported)
+				return true;
+
+			fc.Report.Warning (162, 2, loc, "Unreachable code detected");
+			fc.UnreachableReported = true;
+			return true;
+		}
+
+		public virtual Reachability MarkReachable (Reachability rc)
+		{
+			if (!rc.IsUnreachable)
+				reachable = true;
+
+			return rc;
+		}
+
+		protected void CheckExitBoundaries (BlockContext bc, Block scope)
+		{
+			if (bc.CurrentBlock.ParametersBlock.Original != scope.ParametersBlock.Original) {
+				bc.Report.Error (1632, loc, "Control cannot leave the body of an anonymous method");
+				return;
+			}
+
+			for (var b = bc.CurrentBlock; b != null && b != scope; b = b.Parent) {
+				if (b.IsFinallyBlock) {
+					Error_FinallyClauseExit (bc);
+					break;
+				}
+			}
+		}
+
+		protected void Error_FinallyClauseExit (BlockContext bc)
+		{
+			bc.Report.Error (157, loc, "Control cannot leave the body of a finally clause");
+		}
 	}
 
-	public sealed class EmptyStatement : Statement {
-		
-		private EmptyStatement () {}
-		
-		public static readonly EmptyStatement Value = new EmptyStatement ();
+	public sealed class EmptyStatement : Statement
+	{
+		public EmptyStatement (Location loc)
+		{
+			this.loc = loc;
+		}
 
 		public override bool Resolve (BlockContext ec)
 		{
 			return true;
 		}
 
-		public override bool ResolveUnreachable (BlockContext ec, bool warn)
+		public override void Emit (EmitContext ec)
 		{
-			return true;
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
+			throw new NotSupportedException ();
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
+			return false;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement target)
 		{
 			// nothing needed.
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
-	
+
 	public class If : Statement {
 		Expression expr;
 		public Statement TrueStatement;
 		public Statement FalseStatement;
 
-		bool is_true_ret;
-		
-		public If (Expression expr, Statement true_statement, Location l)
+		bool true_returns, false_returns;
+
+		public If (Expression bool_expr, Statement true_statement, Location l)
+			: this (bool_expr, true_statement, null, l)
 		{
-			this.expr = expr;
-			TrueStatement = true_statement;
-			loc = l;
 		}
 
-		public If (Expression expr,
+		public If (Expression bool_expr,
 			   Statement true_statement,
 			   Statement false_statement,
 			   Location l)
 		{
-			this.expr = expr;
+			this.expr = bool_expr;
 			TrueStatement = true_statement;
 			FalseStatement = false_statement;
 			loc = l;
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-		{
-			expr.MutateHoistedGenericType (storey);
-			TrueStatement.MutateHoistedGenericType (storey);
-			if (FalseStatement != null)
-				FalseStatement.MutateHoistedGenericType (storey);
+		public Expression Expr {
+			get {
+				return this.expr;
+			}
 		}
-
+		
 		public override bool Resolve (BlockContext ec)
 		{
-			bool ok = true;
+			expr = expr.Resolve (ec);
 
-			Report.Debug (1, "START IF BLOCK", loc);
+			var ok = TrueStatement.Resolve (ec);
 
-			expr = Expression.ResolveBoolean (ec, expr, loc);
-			if (expr == null){
-				ok = false;
-				goto skip;
-			}
-
-			Assign ass = expr as Assign;
-			if (ass != null && ass.Source is Constant) {
-				ec.Report.Warning (665, 3, loc, "Assignment in conditional expression is always constant; did you mean to use == instead of = ?");
-			}
-
-			//
-			// Dead code elimination
-			//
-			if (expr is Constant){
-				bool take = !((Constant) expr).IsDefaultValue;
-
-				if (take){
-					if (!TrueStatement.Resolve (ec))
-						return false;
-
-					if ((FalseStatement != null) &&
-					    !FalseStatement.ResolveUnreachable (ec, true))
-						return false;
-					FalseStatement = null;
-				} else {
-					if (!TrueStatement.ResolveUnreachable (ec, true))
-						return false;
-					TrueStatement = null;
-
-					if ((FalseStatement != null) &&
-					    !FalseStatement.Resolve (ec))
-						return false;
-				}
-
-				return true;
-			}
-		skip:
-			ec.StartFlowBranching (FlowBranching.BranchingType.Conditional, loc);
-			
-			ok &= TrueStatement.Resolve (ec);
-
-			is_true_ret = ec.CurrentBranching.CurrentUsageVector.IsUnreachable;
-
-			ec.CurrentBranching.CreateSibling ();
-
-			if (FalseStatement != null)
+			if (FalseStatement != null) {
 				ok &= FalseStatement.Resolve (ec);
-					
-			ec.EndFlowBranching ();
-
-			Report.Debug (1, "END IF BLOCK", loc);
+			}
 
 			return ok;
 		}
 		
 		protected override void DoEmit (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-			Label false_target = ig.DefineLabel ();
+			Label false_target = ec.DefineLabel ();
 			Label end;
 
 			//
@@ -251,20 +247,95 @@ namespace Mono.CSharp {
 			if (FalseStatement != null){
 				bool branch_emitted = false;
 				
-				end = ig.DefineLabel ();
-				if (!is_true_ret){
-					ig.Emit (OpCodes.Br, end);
+				end = ec.DefineLabel ();
+				if (!true_returns){
+					ec.Emit (OpCodes.Br, end);
 					branch_emitted = true;
 				}
 
-				ig.MarkLabel (false_target);
+				ec.MarkLabel (false_target);
 				FalseStatement.Emit (ec);
 
 				if (branch_emitted)
-					ig.MarkLabel (end);
+					ec.MarkLabel (end);
 			} else {
-				ig.MarkLabel (false_target);
+				ec.MarkLabel (false_target);
 			}
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			expr.FlowAnalysisConditional (fc);
+
+			var da_false = new DefiniteAssignmentBitSet (fc.DefiniteAssignmentOnFalse);
+
+			fc.DefiniteAssignment = fc.DefiniteAssignmentOnTrue;
+
+			var res = TrueStatement.FlowAnalysis (fc);
+
+			if (FalseStatement == null) {
+				var c = expr as Constant;
+				if (c != null && !c.IsDefaultValue)
+					return true_returns;
+
+				if (true_returns)
+					fc.DefiniteAssignment = da_false;
+				else
+					fc.DefiniteAssignment &= da_false;
+ 
+				return false;
+			}
+
+			if (true_returns) {
+				fc.DefiniteAssignment = da_false;
+				return FalseStatement.FlowAnalysis (fc);
+			}
+
+			var da_true = fc.DefiniteAssignment;
+
+			fc.DefiniteAssignment = da_false;
+			res &= FalseStatement.FlowAnalysis (fc);
+
+			if (!TrueStatement.IsUnreachable) {
+				if (false_returns || FalseStatement.IsUnreachable)
+					fc.DefiniteAssignment = da_true;
+				else
+					fc.DefiniteAssignment &= da_true;
+			}
+
+			return res;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (rc.IsUnreachable)
+				return rc;
+
+			base.MarkReachable (rc);
+
+			var c = expr as Constant;
+			if (c != null) {
+				bool take = !c.IsDefaultValue;
+				if (take) {
+					rc = TrueStatement.MarkReachable (rc);
+				} else {
+					if (FalseStatement != null)
+						rc = FalseStatement.MarkReachable (rc);
+				}
+
+				return rc;
+			}
+
+			var true_rc = TrueStatement.MarkReachable (rc);
+			true_returns = true_rc.IsUnreachable;
+	
+			if (FalseStatement == null)
+				return rc;
+
+			var false_rc = FalseStatement.MarkReachable (rc);
+			false_returns = false_rc.IsUnreachable;
+
+			return true_rc & false_rc;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -276,145 +347,166 @@ namespace Mono.CSharp {
 			if (FalseStatement != null)
 				target.FalseStatement = FalseStatement.Clone (clonectx);
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
 
-	public class Do : Statement {
+	public class Do : LoopStatement
+	{
 		public Expression expr;
-		public Statement  EmbeddedStatement;
-		
-		public Do (Statement statement, Expression bool_expr, Location l)
+		bool iterator_reachable, end_reachable;
+
+		public Do (Statement statement, BooleanExpression bool_expr, Location doLocation, Location whileLocation)
+			: base (statement)
 		{
 			expr = bool_expr;
-			EmbeddedStatement = statement;
-			loc = l;
+			loc = doLocation;
+			WhileLocation = whileLocation;
 		}
 
-		public override bool Resolve (BlockContext ec)
+		public Location WhileLocation {
+			get; private set;
+		}
+
+		public override bool Resolve (BlockContext bc)
 		{
-			bool ok = true;
+			var ok = base.Resolve (bc);
 
-			ec.StartFlowBranching (FlowBranching.BranchingType.Loop, loc);
-
-			bool was_unreachable = ec.CurrentBranching.CurrentUsageVector.IsUnreachable;
-
-			ec.StartFlowBranching (FlowBranching.BranchingType.Embedded, loc);
-			if (!EmbeddedStatement.Resolve (ec))
-				ok = false;
-			ec.EndFlowBranching ();
-
-			if (ec.CurrentBranching.CurrentUsageVector.IsUnreachable && !was_unreachable)
-				ec.Report.Warning (162, 2, expr.Location, "Unreachable code detected");
-
-			expr = Expression.ResolveBoolean (ec, expr, loc);
-			if (expr == null)
-				ok = false;
-			else if (expr is Constant){
-				bool infinite = !((Constant) expr).IsDefaultValue;
-				if (infinite)
-					ec.CurrentBranching.CurrentUsageVector.Goto ();
-			}
-
-			ec.EndFlowBranching ();
+			expr = expr.Resolve (bc);
 
 			return ok;
 		}
 		
 		protected override void DoEmit (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-			Label loop = ig.DefineLabel ();
+			Label loop = ec.DefineLabel ();
 			Label old_begin = ec.LoopBegin;
 			Label old_end = ec.LoopEnd;
 			
-			ec.LoopBegin = ig.DefineLabel ();
-			ec.LoopEnd = ig.DefineLabel ();
+			ec.LoopBegin = ec.DefineLabel ();
+			ec.LoopEnd = ec.DefineLabel ();
 				
-			ig.MarkLabel (loop);
-			EmbeddedStatement.Emit (ec);
-			ig.MarkLabel (ec.LoopBegin);
+			ec.MarkLabel (loop);
+			Statement.Emit (ec);
+			ec.MarkLabel (ec.LoopBegin);
+
+			// Mark start of while condition
+			ec.Mark (WhileLocation);
 
 			//
 			// Dead code elimination
 			//
-			if (expr is Constant){
+			if (expr is Constant) {
 				bool res = !((Constant) expr).IsDefaultValue;
 
 				expr.EmitSideEffect (ec);
 				if (res)
-					ec.ig.Emit (OpCodes.Br, loop); 
-			} else
+					ec.Emit (OpCodes.Br, loop);
+			} else {
 				expr.EmitBranchable (ec, loop, true);
+			}
 			
-			ig.MarkLabel (ec.LoopEnd);
+			ec.MarkLabel (ec.LoopEnd);
 
 			ec.LoopBegin = old_begin;
 			ec.LoopEnd = old_end;
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			expr.MutateHoistedGenericType (storey);
-			EmbeddedStatement.MutateHoistedGenericType (storey);
+			var res = Statement.FlowAnalysis (fc);
+
+			expr.FlowAnalysisConditional (fc);
+
+			fc.DefiniteAssignment = fc.DefiniteAssignmentOnFalse;
+
+			if (res && !iterator_reachable)
+				return !end_reachable;
+
+			if (!end_reachable) {
+				var c = expr as Constant;
+				if (c != null && !c.IsDefaultValue)
+					return true;
+			}
+
+			return false;
+		}
+		
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			
+			var body_rc = Statement.MarkReachable (rc);
+
+			if (body_rc.IsUnreachable && !iterator_reachable) {
+				expr = new UnreachableExpression (expr);
+				return end_reachable ? rc : Reachability.CreateUnreachable ();
+			}
+
+			if (!end_reachable) {
+				var c = expr as Constant;
+				if (c != null && !c.IsDefaultValue)
+					return Reachability.CreateUnreachable ();
+			}
+
+			return rc;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			Do target = (Do) t;
 
-			target.EmbeddedStatement = EmbeddedStatement.Clone (clonectx);
+			target.Statement = Statement.Clone (clonectx);
 			target.expr = expr.Clone (clonectx);
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+
+		public override void SetEndReachable ()
+		{
+			end_reachable = true;
+		}
+
+		public override void SetIteratorReachable ()
+		{
+			iterator_reachable = true;
 		}
 	}
 
-	public class While : Statement {
+	public class While : LoopStatement
+	{
 		public Expression expr;
-		public Statement Statement;
-		bool infinite, empty;
-		
-		public While (Expression bool_expr, Statement statement, Location l)
+		bool empty, infinite, end_reachable;
+		List<DefiniteAssignmentBitSet> end_reachable_das;
+
+		public While (BooleanExpression bool_expr, Statement statement, Location l)
+			: base (statement)
 		{
 			this.expr = bool_expr;
-			Statement = statement;
 			loc = l;
 		}
 
-		public override bool Resolve (BlockContext ec)
+		public override bool Resolve (BlockContext bc)
 		{
 			bool ok = true;
 
-			expr = Expression.ResolveBoolean (ec, expr, loc);
+			expr = expr.Resolve (bc);
 			if (expr == null)
-				return false;
+				ok = false;
 
-			//
-			// Inform whether we are infinite or not
-			//
-			if (expr is Constant){
-				bool value = !((Constant) expr).IsDefaultValue;
-
-				if (value == false){
-					if (!Statement.ResolveUnreachable (ec, true))
-						return false;
-					empty = true;
-					return true;
-				} else
-					infinite = true;
+			var c = expr as Constant;
+			if (c != null) {
+				empty = c.IsDefaultValue;
+				infinite = !empty;
 			}
 
-			ec.StartFlowBranching (FlowBranching.BranchingType.Loop, loc);
-			if (!infinite)
-				ec.CurrentBranching.CreateSibling ();
-
-			ec.StartFlowBranching (FlowBranching.BranchingType.Embedded, loc);
-			if (!Statement.Resolve (ec))
-				ok = false;
-			ec.EndFlowBranching ();
-
-			// There's no direct control flow from the end of the embedded statement to the end of the loop
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
-
-			ec.EndFlowBranching ();
-
+			ok &= base.Resolve (bc);
 			return ok;
 		}
 		
@@ -425,51 +517,100 @@ namespace Mono.CSharp {
 				return;
 			}
 
-			ILGenerator ig = ec.ig;
 			Label old_begin = ec.LoopBegin;
 			Label old_end = ec.LoopEnd;
 			
-			ec.LoopBegin = ig.DefineLabel ();
-			ec.LoopEnd = ig.DefineLabel ();
+			ec.LoopBegin = ec.DefineLabel ();
+			ec.LoopEnd = ec.DefineLabel ();
 
 			//
 			// Inform whether we are infinite or not
 			//
-			if (expr is Constant){
+			if (expr is Constant) {
 				// expr is 'true', since the 'empty' case above handles the 'false' case
-				ig.MarkLabel (ec.LoopBegin);
+				ec.MarkLabel (ec.LoopBegin);
+
+				if (ec.EmitAccurateDebugInfo)
+					ec.Emit (OpCodes.Nop);
+
 				expr.EmitSideEffect (ec);
 				Statement.Emit (ec);
-				ig.Emit (OpCodes.Br, ec.LoopBegin);
+				ec.Emit (OpCodes.Br, ec.LoopBegin);
 					
 				//
 				// Inform that we are infinite (ie, `we return'), only
 				// if we do not `break' inside the code.
 				//
-				ig.MarkLabel (ec.LoopEnd);
+				ec.MarkLabel (ec.LoopEnd);
 			} else {
-				Label while_loop = ig.DefineLabel ();
+				Label while_loop = ec.DefineLabel ();
 
-				ig.Emit (OpCodes.Br, ec.LoopBegin);
-				ig.MarkLabel (while_loop);
+				ec.Emit (OpCodes.Br, ec.LoopBegin);
+				ec.MarkLabel (while_loop);
 
 				Statement.Emit (ec);
 			
-				ig.MarkLabel (ec.LoopBegin);
-				ec.Mark (loc);
+				ec.MarkLabel (ec.LoopBegin);
 
+				ec.Mark (loc);
 				expr.EmitBranchable (ec, while_loop, true);
 				
-				ig.MarkLabel (ec.LoopEnd);
+				ec.MarkLabel (ec.LoopEnd);
 			}	
 
 			ec.LoopBegin = old_begin;
 			ec.LoopEnd = old_end;
 		}
 
-		public override void Emit (EmitContext ec)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			DoEmit (ec);
+			expr.FlowAnalysisConditional (fc);
+
+			fc.DefiniteAssignment = fc.DefiniteAssignmentOnTrue;
+			var da_false = new DefiniteAssignmentBitSet (fc.DefiniteAssignmentOnFalse);
+
+			Statement.FlowAnalysis (fc);
+
+			//
+			// Special case infinite while with breaks
+			//
+			if (end_reachable_das != null) {
+				da_false = DefiniteAssignmentBitSet.And (end_reachable_das);
+				end_reachable_das = null;
+			}
+
+			fc.DefiniteAssignment = da_false;
+
+			if (infinite && !end_reachable)
+				return true;
+
+			return false;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (rc.IsUnreachable)
+				return rc;
+
+			base.MarkReachable (rc);
+
+			//
+			// Special case unreachable while body
+			//
+			if (empty) {
+				Statement.MarkReachable (Reachability.CreateUnreachable ());
+				return rc;
+			}
+
+			Statement.MarkReachable (rc);
+
+			//
+			// When infinite while end is unreachable via break anything what follows is unreachable too
+			//
+			if (infinite && !end_reachable)
+				return Reachability.CreateUnreachable ();
+
+			return rc;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -479,186 +620,283 @@ namespace Mono.CSharp {
 			target.expr = expr.Clone (clonectx);
 			target.Statement = Statement.Clone (clonectx);
 		}
-
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		
+		public override object Accept (StructuralVisitor visitor)
 		{
-			expr.MutateHoistedGenericType (storey);
-			Statement.MutateHoistedGenericType (storey);
+			return visitor.Visit (this);
+		}
+
+		public override void AddEndDefiniteAssignment (FlowAnalysisContext fc)
+		{
+			if (!infinite)
+				return;
+
+			if (end_reachable_das == null)
+				end_reachable_das = new List<DefiniteAssignmentBitSet> ();
+
+			end_reachable_das.Add (fc.DefiniteAssignment);
+		}
+
+		public override void SetEndReachable ()
+		{
+			end_reachable = true;
 		}
 	}
 
-	public class For : Statement {
-		Expression Test;
-		Statement InitStatement;
-		Statement Increment;
-		public Statement Statement;
-		bool infinite, empty;
+	public class For : LoopStatement
+	{
+		bool infinite, empty, iterator_reachable, end_reachable;
+		List<DefiniteAssignmentBitSet> end_reachable_das;
 		
-		public For (Statement init_statement,
-			    Expression test,
-			    Statement increment,
-			    Statement statement,
-			    Location l)
+		public For (Location l)
+			: base (null)
 		{
-			InitStatement = init_statement;
-			Test = test;
-			Increment = increment;
-			Statement = statement;
 			loc = l;
 		}
 
-		public override bool Resolve (BlockContext ec)
+		public Statement Initializer {
+			get; set;
+		}
+
+		public Expression Condition {
+			get; set;
+		}
+
+		public Statement Iterator {
+			get; set;
+		}
+
+		public override bool Resolve (BlockContext bc)
 		{
-			bool ok = true;
+			Initializer.Resolve (bc);
 
-			if (InitStatement != null){
-				if (!InitStatement.Resolve (ec))
-					ok = false;
-			}
-
-			if (Test != null){
-				Test = Expression.ResolveBoolean (ec, Test, loc);
-				if (Test == null)
-					ok = false;
-				else if (Test is Constant){
-					bool value = !((Constant) Test).IsDefaultValue;
-
-					if (value == false){
-						if (!Statement.ResolveUnreachable (ec, true))
-							return false;
-						if ((Increment != null) &&
-						    !Increment.ResolveUnreachable (ec, false))
-							return false;
+			if (Condition != null) {
+				Condition = Condition.Resolve (bc);
+				var condition_constant = Condition as Constant;
+				if (condition_constant != null) {
+					if (condition_constant.IsDefaultValue) {
 						empty = true;
-						return true;
-					} else
+					} else {
 						infinite = true;
+					}
 				}
-			} else
+			} else {
 				infinite = true;
-
-			ec.StartFlowBranching (FlowBranching.BranchingType.Loop, loc);
-			if (!infinite)
-				ec.CurrentBranching.CreateSibling ();
-
-			bool was_unreachable = ec.CurrentBranching.CurrentUsageVector.IsUnreachable;
-
-			ec.StartFlowBranching (FlowBranching.BranchingType.Embedded, loc);
-			if (!Statement.Resolve (ec))
-				ok = false;
-			ec.EndFlowBranching ();
-
-			if (Increment != null){
-				if (ec.CurrentBranching.CurrentUsageVector.IsUnreachable) {
-					if (!Increment.ResolveUnreachable (ec, !was_unreachable))
-						ok = false;
-				} else {
-					if (!Increment.Resolve (ec))
-						ok = false;
-				}
 			}
 
-			// There's no direct control flow from the end of the embedded statement to the end of the loop
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
+			return base.Resolve (bc) && Iterator.Resolve (bc);
+		}
 
-			ec.EndFlowBranching ();
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			Initializer.FlowAnalysis (fc);
 
-			return ok;
+			DefiniteAssignmentBitSet da_false;
+			if (Condition != null) {
+				Condition.FlowAnalysisConditional (fc);
+				fc.DefiniteAssignment = fc.DefiniteAssignmentOnTrue;
+				da_false = new DefiniteAssignmentBitSet (fc.DefiniteAssignmentOnFalse);
+			} else {
+				da_false = fc.BranchDefiniteAssignment ();
+			}
+
+			Statement.FlowAnalysis (fc);
+
+			Iterator.FlowAnalysis (fc);
+
+			//
+			// Special case infinite for with breaks
+			//
+			if (end_reachable_das != null) {
+				da_false = DefiniteAssignmentBitSet.And (end_reachable_das);
+				end_reachable_das = null;
+			}
+
+			fc.DefiniteAssignment = da_false;
+
+			if (infinite && !end_reachable)
+				return true;
+
+			return false;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			Initializer.MarkReachable (rc);
+
+			var body_rc = Statement.MarkReachable (rc);
+			if (!body_rc.IsUnreachable || iterator_reachable) {
+				Iterator.MarkReachable (rc);
+			}
+
+			//
+			// When infinite for end is unreachable via break anything what follows is unreachable too
+			//
+			if (infinite && !end_reachable) {
+				return Reachability.CreateUnreachable ();
+			}
+
+			return rc;
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			if (InitStatement != null && InitStatement != EmptyStatement.Value)
-				InitStatement.Emit (ec);
+			if (Initializer != null)
+				Initializer.Emit (ec);
 
 			if (empty) {
-				Test.EmitSideEffect (ec);
+				Condition.EmitSideEffect (ec);
 				return;
 			}
 
-			ILGenerator ig = ec.ig;
 			Label old_begin = ec.LoopBegin;
 			Label old_end = ec.LoopEnd;
-			Label loop = ig.DefineLabel ();
-			Label test = ig.DefineLabel ();
+			Label loop = ec.DefineLabel ();
+			Label test = ec.DefineLabel ();
 
-			ec.LoopBegin = ig.DefineLabel ();
-			ec.LoopEnd = ig.DefineLabel ();
+			ec.LoopBegin = ec.DefineLabel ();
+			ec.LoopEnd = ec.DefineLabel ();
 
-			ig.Emit (OpCodes.Br, test);
-			ig.MarkLabel (loop);
+			ec.Emit (OpCodes.Br, test);
+			ec.MarkLabel (loop);
 			Statement.Emit (ec);
 
-			ig.MarkLabel (ec.LoopBegin);
-			if (Increment != EmptyStatement.Value)
-				Increment.Emit (ec);
+			ec.MarkLabel (ec.LoopBegin);
+			Iterator.Emit (ec);
 
-			ig.MarkLabel (test);
+			ec.MarkLabel (test);
 			//
 			// If test is null, there is no test, and we are just
 			// an infinite loop
 			//
-			if (Test != null){
+			if (Condition != null) {
+				ec.Mark (Condition.Location);
+
 				//
 				// The Resolve code already catches the case for
 				// Test == Constant (false) so we know that
 				// this is true
 				//
-				if (Test is Constant) {
-					Test.EmitSideEffect (ec);
-					ig.Emit (OpCodes.Br, loop);
+				if (Condition is Constant) {
+					Condition.EmitSideEffect (ec);
+					ec.Emit (OpCodes.Br, loop);
 				} else {
-					Test.EmitBranchable (ec, loop, true);
+					Condition.EmitBranchable (ec, loop, true);
 				}
 				
 			} else
-				ig.Emit (OpCodes.Br, loop);
-			ig.MarkLabel (ec.LoopEnd);
+				ec.Emit (OpCodes.Br, loop);
+			ec.MarkLabel (ec.LoopEnd);
 
 			ec.LoopBegin = old_begin;
 			ec.LoopEnd = old_end;
-		}
-
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-		{
-			if (InitStatement != null)
-				InitStatement.MutateHoistedGenericType (storey);
-			if (Test != null)
-				Test.MutateHoistedGenericType (storey);
-			if (Increment != null)
-				Increment.MutateHoistedGenericType (storey);
-
-			Statement.MutateHoistedGenericType (storey);
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			For target = (For) t;
 
-			if (InitStatement != null)
-				target.InitStatement = InitStatement.Clone (clonectx);
-			if (Test != null)
-				target.Test = Test.Clone (clonectx);
-			if (Increment != null)
-				target.Increment = Increment.Clone (clonectx);
+			if (Initializer != null)
+				target.Initializer = Initializer.Clone (clonectx);
+			if (Condition != null)
+				target.Condition = Condition.Clone (clonectx);
+			if (Iterator != null)
+				target.Iterator = Iterator.Clone (clonectx);
 			target.Statement = Statement.Clone (clonectx);
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+
+		public override void AddEndDefiniteAssignment (FlowAnalysisContext fc)
+		{
+			if (!infinite)
+				return;
+
+			if (end_reachable_das == null)
+				end_reachable_das = new List<DefiniteAssignmentBitSet> ();
+
+			end_reachable_das.Add (fc.DefiniteAssignment);
+		}
+
+		public override void SetEndReachable ()
+		{
+			end_reachable = true;
+		}
+
+		public override void SetIteratorReachable ()
+		{
+			iterator_reachable = true;
+		}
+	}
+
+	public abstract class LoopStatement : Statement
+	{
+		protected LoopStatement (Statement statement)
+		{
+			Statement = statement;
+		}
+
+		public Statement Statement { get; set; }
+
+		public override bool Resolve (BlockContext bc)
+		{
+			var prev_loop = bc.EnclosingLoop;
+			var prev_los = bc.EnclosingLoopOrSwitch;
+			bc.EnclosingLoopOrSwitch = bc.EnclosingLoop = this;
+			var ok = Statement.Resolve (bc);
+			bc.EnclosingLoopOrSwitch = prev_los;
+			bc.EnclosingLoop = prev_loop;
+
+			return ok;
+		}
+
+		//
+		// Needed by possibly infinite loops statements (for, while) and switch statment
+		//
+		public virtual void AddEndDefiniteAssignment (FlowAnalysisContext fc)
+		{
+		}
+
+		public virtual void SetEndReachable ()
+		{
+		}
+
+		public virtual void SetIteratorReachable ()
+		{
 		}
 	}
 	
-	public class StatementExpression : Statement {
+	public class StatementExpression : Statement
+	{
 		ExpressionStatement expr;
 		
 		public StatementExpression (ExpressionStatement expr)
 		{
 			this.expr = expr;
-			loc = expr.Location;
+			loc = expr.StartLocation;
 		}
 
-		public override bool Resolve (BlockContext ec)
+		public StatementExpression (ExpressionStatement expr, Location loc)
 		{
-			if (expr != null && expr.eclass == ExprClass.Invalid)
-				expr = expr.ResolveStatement (ec);
-			return expr != null;
+			this.expr = expr;
+			this.loc = loc;
+		}
+
+		public ExpressionStatement Expr {
+			get {
+ 				return this.expr;
+			}
+		}
+		
+		protected override void CloneTo (CloneContext clonectx, Statement t)
+		{
+			StatementExpression target = (StatementExpression) t;
+			target.expr = (ExpressionStatement) expr.Clone (clonectx);
 		}
 		
 		protected override void DoEmit (EmitContext ec)
@@ -666,44 +904,196 @@ namespace Mono.CSharp {
 			expr.EmitStatement (ec);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			expr.MutateHoistedGenericType (storey);
+			expr.FlowAnalysis (fc);
+			return false;
 		}
 
-		public override string ToString ()
+		public override Reachability MarkReachable (Reachability rc)
 		{
-			return "StatementExpression (" + expr + ")";
+			base.MarkReachable (rc);
+			expr.MarkReachable (rc);
+			return rc;
 		}
 
-		protected override void CloneTo (CloneContext clonectx, Statement t)
+		public override bool Resolve (BlockContext ec)
 		{
-			StatementExpression target = (StatementExpression) t;
-
-			target.expr = (ExpressionStatement) expr.Clone (clonectx);
+			expr = expr.ResolveStatement (ec);
+			return expr != null;
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
-	// A 'return' or a 'yield break'
+	public class StatementErrorExpression : Statement
+	{
+		Expression expr;
+
+		public StatementErrorExpression (Expression expr)
+		{
+			this.expr = expr;
+			this.loc = expr.StartLocation;
+		}
+
+		public Expression Expr {
+			get {
+				return expr;
+			}
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			expr.Error_InvalidExpressionStatement (bc);
+			return true;
+		}
+
+		protected override void DoEmit (EmitContext ec)
+		{
+			throw new NotSupportedException ();
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			return false;
+		}
+
+		protected override void CloneTo (CloneContext clonectx, Statement target)
+		{
+			var t = (StatementErrorExpression) target;
+
+			t.expr = expr.Clone (clonectx);
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+	}
+
+	//
+	// Simple version of statement list not requiring a block
+	//
+	public class StatementList : Statement
+	{
+		List<Statement> statements;
+
+		public StatementList (Statement first, Statement second)
+		{
+			statements = new List<Statement> { first, second };
+		}
+
+		#region Properties
+		public IList<Statement> Statements {
+			get {
+				return statements;
+			}
+		}
+		#endregion
+
+		public void Add (Statement statement)
+		{
+			statements.Add (statement);
+		}
+
+		public override bool Resolve (BlockContext ec)
+		{
+			foreach (var s in statements)
+				s.Resolve (ec);
+
+			return true;
+		}
+
+		protected override void DoEmit (EmitContext ec)
+		{
+			foreach (var s in statements)
+				s.Emit (ec);
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			foreach (var s in statements)
+				s.FlowAnalysis (fc);
+
+			return false;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			Reachability res = rc;
+			foreach (var s in statements)
+				res = s.MarkReachable (rc);
+
+			return res;
+		}
+
+		protected override void CloneTo (CloneContext clonectx, Statement target)
+		{
+			StatementList t = (StatementList) target;
+
+			t.statements = new List<Statement> (statements.Count);
+			foreach (Statement s in statements)
+				t.statements.Add (s.Clone (clonectx));
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+	}
+
+	//
+	// For statements which require special handling when inside try or catch block
+	//
 	public abstract class ExitStatement : Statement
 	{
 		protected bool unwind_protect;
-		protected abstract bool DoResolve (BlockContext ec);
 
-		public virtual void Error_FinallyClause (Report Report)
+		protected abstract bool DoResolve (BlockContext bc);
+		protected abstract bool IsLocalExit { get; }
+
+		public override bool Resolve (BlockContext bc)
 		{
-			Report.Error (157, loc, "Control cannot leave the body of a finally clause");
+			var res = DoResolve (bc);
+
+			if (!IsLocalExit) {
+				//
+				// We are inside finally scope but is it the scope we are exiting
+				//
+				if (bc.HasSet (ResolveContext.Options.FinallyScope)) {
+
+					for (var b = bc.CurrentBlock; b != null; b = b.Parent) {
+						if (b.IsFinallyBlock) {
+							Error_FinallyClauseExit (bc);
+							break;
+						}
+
+						if (b is ParametersBlock)
+							break;
+					}
+				}
+			}
+
+			unwind_protect = bc.HasAny (ResolveContext.Options.TryScope | ResolveContext.Options.CatchScope);
+			return res;
 		}
 
-		public sealed override bool Resolve (BlockContext ec)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			if (!DoResolve (ec))
-				return false;
+			if (IsLocalExit)
+				return true;
 
-			unwind_protect = ec.CurrentBranching.AddReturnOrigin (ec.CurrentBranching.CurrentUsageVector, this);
-			if (unwind_protect)
-				ec.NeedReturnLabel ();
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
+			if (fc.TryFinally != null) {
+			    fc.TryFinally.RegisterForControlExitCheck (new DefiniteAssignmentBitSet (fc.DefiniteAssignment));
+			} else {
+			    fc.ParametersBlock.CheckControlExit (fc);
+			}
+
 			return true;
 		}
 	}
@@ -711,51 +1101,168 @@ namespace Mono.CSharp {
 	/// <summary>
 	///   Implements the return statement
 	/// </summary>
-	public class Return : ExitStatement {
-		protected Expression Expr;
+	public class Return : ExitStatement
+	{
+		Expression expr;
+
 		public Return (Expression expr, Location l)
 		{
-			Expr = expr;
+			this.expr = expr;
 			loc = l;
 		}
-		
+
+		#region Properties
+
+		public Expression Expr {
+			get {
+				return expr;
+			}
+			protected set {
+				expr = value;
+			}
+		}
+
+		protected override bool IsLocalExit {
+			get {
+				return false;
+			}
+		}
+
+		#endregion
+
 		protected override bool DoResolve (BlockContext ec)
 		{
-			if (Expr == null) {
-				if (ec.ReturnType == TypeManager.void_type)
+			var block_return_type = ec.ReturnType;
+
+			if (expr == null) {
+				if (block_return_type.Kind == MemberKind.Void)
 					return true;
-				
-				ec.Report.Error (126, loc,
-					"An object of a type convertible to `{0}' is required for the return statement",
-					TypeManager.CSharpName (ec.ReturnType));
+
+				//
+				// Return must not be followed by an expression when
+				// the method return type is Task
+				//
+				if (ec.CurrentAnonymousMethod is AsyncInitializer) {
+					var storey = (AsyncTaskStorey) ec.CurrentAnonymousMethod.Storey;
+					if (storey.ReturnType == ec.Module.PredefinedTypes.Task.TypeSpec) {
+						//
+						// Extra trick not to emit ret/leave inside awaiter body
+						//
+						expr = EmptyExpression.Null;
+						return true;
+					}
+
+					if (storey.ReturnType.IsGenericTask)
+						block_return_type = storey.ReturnType.TypeArguments[0];
+				}
+
+				if (ec.CurrentIterator != null) {
+					Error_ReturnFromIterator (ec);
+				} else if (block_return_type != InternalType.ErrorType) {
+					ec.Report.Error (126, loc,
+						"An object of a type convertible to `{0}' is required for the return statement",
+						block_return_type.GetSignatureForError ());
+				}
+
 				return false;
 			}
 
-			if (ec.CurrentBlock.Toplevel.IsIterator) {
-				ec.Report.Error (1622, loc, "Cannot return a value from iterators. Use the yield return " +
-						  "statement to return a value, or yield break to end the iteration");
-			}
+			expr = expr.Resolve (ec);
 
 			AnonymousExpression am = ec.CurrentAnonymousMethod;
-			if (am == null && ec.ReturnType == TypeManager.void_type) {
-				ec.Report.Error (127, loc, "`{0}': A return keyword must not be followed by any expression when method returns void",
-					ec.GetSignatureForError ());
+			if (am == null) {
+				if (block_return_type.Kind == MemberKind.Void) {
+					ec.Report.Error (127, loc,
+						"`{0}': A return keyword must not be followed by any expression when method returns void",
+						ec.GetSignatureForError ());
+
+					return false;
+				}
+			} else {
+				if (am.IsIterator) {
+					Error_ReturnFromIterator (ec);
+					return false;
+				}
+
+				var async_block = am as AsyncInitializer;
+				if (async_block != null) {
+					if (expr != null) {
+						var storey = (AsyncTaskStorey) am.Storey;
+						var async_type = storey.ReturnType;
+
+						if (async_type == null && async_block.ReturnTypeInference != null) {
+							if (expr.Type.Kind == MemberKind.Void && !(this is ContextualReturn))
+								ec.Report.Error (4029, loc, "Cannot return an expression of type `void'");
+							else
+								async_block.ReturnTypeInference.AddCommonTypeBoundAsync (expr.Type);
+							return true;
+						}
+
+						if (async_type.Kind == MemberKind.Void) {
+							ec.Report.Error (8030, loc,
+								"Anonymous function or lambda expression converted to a void returning delegate cannot return a value");
+							return false;
+						}
+
+						if (!async_type.IsGenericTask) {
+							if (this is ContextualReturn)
+								return true;
+
+							if (async_block.DelegateType != null) {
+								ec.Report.Error (8031, loc,
+									"Async lambda expression or anonymous method converted to a `Task' cannot return a value. Consider returning `Task<T>'");
+							} else {
+								ec.Report.Error (1997, loc,
+									"`{0}': A return keyword must not be followed by an expression when async method returns `Task'. Consider using `Task<T>' return type",
+									ec.GetSignatureForError ());
+							}
+							return false;
+						}
+
+						//
+						// The return type is actually Task<T> type argument
+						//
+						if (expr.Type == async_type) {
+							ec.Report.Error (4016, loc,
+								"`{0}': The return expression type of async method must be `{1}' rather than `Task<{1}>'",
+								ec.GetSignatureForError (), async_type.TypeArguments[0].GetSignatureForError ());
+						} else {
+							block_return_type = async_type.TypeArguments[0];
+						}
+					}
+				} else {
+					if (block_return_type.Kind == MemberKind.Void) {
+						ec.Report.Error (8030, loc,
+							"Anonymous function or lambda expression converted to a void returning delegate cannot return a value");
+						return false;
+					}
+
+					var l = am as AnonymousMethodBody;
+					if (l != null && expr != null) {
+						if (l.ReturnTypeInference != null) {
+							l.ReturnTypeInference.AddCommonTypeBound (expr.Type);
+							return true;
+						}
+
+						//
+						// Try to optimize simple lambda. Only when optimizations are enabled not to cause
+						// unexpected debugging experience
+						//
+						if (this is ContextualReturn && !ec.IsInProbingMode && ec.Module.Compiler.Settings.Optimize) {
+							l.DirectMethodGroupConversion = expr.CanReduceLambda (l);
+						}
+					}
+				}
 			}
 
-			Expr = Expr.Resolve (ec);
-			if (Expr == null)
+			if (expr == null)
 				return false;
 
-			if (ec.HasSet (ResolveContext.Options.InferReturnType)) {
-				ec.ReturnTypeInference.AddCommonTypeBound (Expr.Type);
-				return true;
-			}
+			if (expr.Type != block_return_type && expr.Type != InternalType.ErrorType) {
+				expr = Convert.ImplicitConversionRequired (ec, expr, block_return_type, loc);
 
-			if (Expr.Type != ec.ReturnType) {
-				Expr = Convert.ImplicitConversionRequired (ec, Expr, ec.ReturnType, loc);
-
-				if (Expr == null) {
-					if (am != null) {
+				if (expr == null) {
+					if (am != null && block_return_type == ec.ReturnType) {
 						ec.Report.Error (1662, loc,
 							"Cannot convert `{0}' to delegate type `{1}' because some of the return types in the block are not implicitly convertible to the delegate return type",
 							am.ContainerType, am.GetSignatureForError ());
@@ -769,46 +1276,99 @@ namespace Mono.CSharp {
 		
 		protected override void DoEmit (EmitContext ec)
 		{
-			if (Expr != null) {
-				Expr.Emit (ec);
+			if (expr != null) {
 
-				if (unwind_protect)
-					ec.ig.Emit (OpCodes.Stloc, ec.TemporaryReturn ());
+				var async_body = ec.CurrentAnonymousMethod as AsyncInitializer;
+				if (async_body != null) {
+					var storey = (AsyncTaskStorey)async_body.Storey;
+					Label exit_label = async_body.BodyEnd;
+
+					//
+					// It's null for await without async
+					//
+					if (storey.HoistedReturnValue != null) {
+						//
+						// Special case hoisted return value (happens in try/finally scenario)
+						//
+						if (ec.TryFinallyUnwind != null) {
+							if (storey.HoistedReturnValue is VariableReference) {
+								storey.HoistedReturnValue = ec.GetTemporaryField (storey.HoistedReturnValue.Type);
+							}
+
+							exit_label = TryFinally.EmitRedirectedReturn (ec, async_body);
+						}
+
+						var async_return = (IAssignMethod)storey.HoistedReturnValue;
+						async_return.EmitAssign (ec, expr, false, false);
+						ec.EmitEpilogue ();
+					} else {
+						expr.Emit (ec);
+
+						if (ec.TryFinallyUnwind != null)
+							exit_label = TryFinally.EmitRedirectedReturn (ec, async_body);
+					}
+
+					ec.Emit (OpCodes.Leave, exit_label);
+					return;
+				}
+
+				expr.Emit (ec);
+				ec.EmitEpilogue ();
+
+				if (unwind_protect || ec.EmitAccurateDebugInfo)
+					ec.Emit (OpCodes.Stloc, ec.TemporaryReturn ());
 			}
 
-			if (unwind_protect)
-				ec.ig.Emit (OpCodes.Leave, ec.ReturnLabel);
-			else
-				ec.ig.Emit (OpCodes.Ret);
+			if (unwind_protect) {
+				ec.Emit (OpCodes.Leave, ec.CreateReturnLabel ());
+			} else if (ec.EmitAccurateDebugInfo) {
+				ec.Emit (OpCodes.Br, ec.CreateReturnLabel ());
+			} else {
+				ec.Emit (OpCodes.Ret);
+			}
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			if (Expr != null)
-				Expr.MutateHoistedGenericType (storey);
+			if (expr != null)
+				expr.FlowAnalysis (fc);
+
+			base.DoFlowAnalysis (fc);
+			return true;
+		}
+
+		void Error_ReturnFromIterator (ResolveContext rc)
+		{
+			rc.Report.Error (1622, loc,
+				"Cannot return a value from iterators. Use the yield return statement to return a value, or yield break to end the iteration");
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			return Reachability.CreateUnreachable ();
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			Return target = (Return) t;
 			// It's null for simple return;
-			if (Expr != null)
-				target.Expr = Expr.Clone (clonectx);
+			if (expr != null)
+				target.expr = expr.Clone (clonectx);
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
-	public class Goto : Statement {
+	public class Goto : ExitStatement
+	{
 		string target;
 		LabeledStatement label;
-		bool unwind_protect;
+		TryFinally try_finally;
 
-		public override bool Resolve (BlockContext ec)
-		{
-			unwind_protect = ec.CurrentBranching.AddGotoOrigin (ec.CurrentBranching.CurrentUsageVector, this);
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
-			return true;
-		}
-		
 		public Goto (string label, Location l)
 		{
 			loc = l;
@@ -819,10 +1379,65 @@ namespace Mono.CSharp {
 			get { return target; }
 		}
 
-		public void SetResolvedTarget (LabeledStatement label)
+		protected override bool IsLocalExit {
+			get {
+				return true;
+			}
+		}
+
+		protected override bool DoResolve (BlockContext bc)
 		{
-			this.label = label;
-			label.AddReference ();
+			label = bc.CurrentBlock.LookupLabel (target);
+			if (label == null) {
+				Error_UnknownLabel (bc, target, loc);
+				return false;
+			}
+
+			try_finally = bc.CurrentTryBlock as TryFinally;
+
+			CheckExitBoundaries (bc, label.Block);
+
+			return true;
+		}
+
+		public static void Error_UnknownLabel (BlockContext bc, string label, Location loc)
+		{
+			bc.Report.Error (159, loc, "The label `{0}:' could not be found within the scope of the goto statement",
+				label);
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			if (fc.LabelStack == null) {
+				fc.LabelStack = new List<LabeledStatement> ();
+			} else if (fc.LabelStack.Contains (label)) {
+				return true;
+			}
+
+			fc.LabelStack.Add (label);
+			label.Block.ScanGotoJump (label, fc);
+			fc.LabelStack.Remove (label);
+			return true;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (rc.IsUnreachable)
+				return rc;
+
+			base.MarkReachable (rc);
+
+			if (try_finally != null) {
+				if (try_finally.FinallyBlock.HasReachableClosingBrace) {
+					label.AddGotoReference (rc, false);
+				} else {
+					label.AddGotoReference (rc, true);
+				}
+			} else {
+				label.AddGotoReference (rc, false);
+			}
+
+			return Reachability.CreateUnreachable ();
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement target)
@@ -834,12 +1449,33 @@ namespace Mono.CSharp {
 		{
 			if (label == null)
 				throw new InternalErrorException ("goto emitted before target resolved");
+
 			Label l = label.LabelTarget (ec);
-			ec.ig.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, l);
+
+			if (ec.TryFinallyUnwind != null && IsLeavingFinally (label.Block)) {
+				var async_body = (AsyncInitializer) ec.CurrentAnonymousMethod;
+				l = TryFinally.EmitRedirectedJump (ec, async_body, l, label.Block);
+			}
+
+			ec.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, l);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		bool IsLeavingFinally (Block labelBlock)
 		{
+			var b = try_finally.Statement as Block;
+			while (b != null) {
+				if (b == labelBlock)
+					return true;
+
+				b = b.Parent;
+			}
+
+			return false;
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
@@ -847,14 +1483,14 @@ namespace Mono.CSharp {
 		string name;
 		bool defined;
 		bool referenced;
+		bool finalTarget;
 		Label label;
-		ILGenerator ig;
-
-		FlowBranching.UsageVector vectors;
+		Block block;
 		
-		public LabeledStatement (string name, Location l)
+		public LabeledStatement (string name, Block block, Location l)
 		{
 			this.name = name;
+			this.block = block;
 			this.loc = l;
 		}
 
@@ -862,63 +1498,87 @@ namespace Mono.CSharp {
 		{
 			if (defined)
 				return label;
-			ig = ec.ig;
-			label = ec.ig.DefineLabel ();
-			defined = true;
 
+			label = ec.DefineLabel ();
+			defined = true;
 			return label;
+		}
+
+		public Block Block {
+			get {
+				return block;
+			}
 		}
 
 		public string Name {
 			get { return name; }
 		}
 
-		public bool IsDefined {
-			get { return defined; }
-		}
-
-		public bool HasBeenReferenced {
-			get { return referenced; }
-		}
-
-		public FlowBranching.UsageVector JumpOrigins {
-			get { return vectors; }
-		}
-
-		public void AddUsageVector (FlowBranching.UsageVector vector)
-		{
-			vector = vector.Clone ();
-			vector.Next = vectors;
-			vectors = vector;
-		}
-
 		protected override void CloneTo (CloneContext clonectx, Statement target)
 		{
-			// nothing to clone
+			var t = (LabeledStatement) target;
+
+			t.block = clonectx.RemapBlockCopy (block);
 		}
 
-		public override bool Resolve (BlockContext ec)
+		public override bool Resolve (BlockContext bc)
 		{
-			// this flow-branching will be terminated when the surrounding block ends
-			ec.StartFlowBranching (this);
 			return true;
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			if (ig != null && ig != ec.ig)
-				throw new InternalErrorException ("cannot happen");
 			LabelTarget (ec);
-			ec.ig.MarkLabel (label);
+			ec.MarkLabel (label);
+
+			if (finalTarget)
+				ec.Emit (OpCodes.Br_S, label);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
+			if (!referenced) {
+				fc.Report.Warning (164, 2, loc, "This label has not been referenced");
+			}
+
+			return false;
 		}
 
-		public void AddReference ()
+		public override Reachability MarkReachable (Reachability rc)
 		{
+			base.MarkReachable (rc);
+
+			if (referenced)
+				rc = new Reachability ();
+
+			return rc;
+		}
+
+		public void AddGotoReference (Reachability rc, bool finalTarget)
+		{
+			if (referenced)
+				return;
+
 			referenced = true;
+			MarkReachable (rc);
+
+			//
+			// Label is final target when goto jumps out of try block with
+			// finally clause. In that case we need leave with target but in C#
+			// terms the label is unreachable. Using finalTarget we emit
+			// explicit label not just marker
+			//
+			if (finalTarget) {
+				this.finalTarget = true;
+				return;
+			}
+
+			block.ScanGotoJump (this);
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 	
@@ -926,112 +1586,111 @@ namespace Mono.CSharp {
 	/// <summary>
 	///   `goto default' statement
 	/// </summary>
-	public class GotoDefault : Statement {
-		
+	public class GotoDefault : SwitchGoto
+	{		
 		public GotoDefault (Location l)
+			: base (l)
 		{
-			loc = l;
 		}
 
-		protected override void CloneTo (CloneContext clonectx, Statement target)
+		public override bool Resolve (BlockContext bc)
 		{
-			// nothing to clone
-		}
-
-		public override bool Resolve (BlockContext ec)
-		{
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
-
-			if (ec.Switch == null) {
-				ec.Report.Error (153, loc, "A goto case is only valid inside a switch statement");
+			if (bc.Switch == null) {
+				Error_GotoCaseRequiresSwitchBlock (bc);
 				return false;
 			}
 
-			if (!ec.Switch.GotDefault) {
-				FlowBranchingBlock.Error_UnknownLabel (loc, "default", ec.Report);
-				return false;
-			}
+			bc.Switch.RegisterGotoCase (null, null);
+			base.Resolve (bc);
 
 			return true;
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			ec.ig.Emit (OpCodes.Br, ec.Switch.DefaultTarget);
+			ec.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, ec.Switch.DefaultLabel.GetILLabel (ec));
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		public override Reachability MarkReachable (Reachability rc)
 		{
+			if (!rc.IsUnreachable) {
+				var label = switch_statement.DefaultLabel;
+				if (label.IsUnreachable) {
+					label.MarkReachable (rc);
+					switch_statement.Block.ScanGotoJump (label);
+				}
+			}
+
+			return base.MarkReachable (rc);
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
 	/// <summary>
 	///   `goto case' statement
 	/// </summary>
-	public class GotoCase : Statement {
+	public class GotoCase : SwitchGoto
+	{
 		Expression expr;
-		SwitchLabel sl;
 		
 		public GotoCase (Expression e, Location l)
+			: base (l)
 		{
 			expr = e;
-			loc = l;
 		}
+
+		public Expression Expr {
+			get {
+ 				return expr;
+			}
+		}
+
+		public SwitchLabel Label { get; set; }
 
 		public override bool Resolve (BlockContext ec)
 		{
-			if (ec.Switch == null){
-				ec.Report.Error (153, loc, "A goto case is only valid inside a switch statement");
+			if (ec.Switch == null) {
+				Error_GotoCaseRequiresSwitchBlock (ec);
 				return false;
 			}
 
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
-
-			expr = expr.Resolve (ec);
-			if (expr == null)
-				return false;
-
-			Constant c = expr as Constant;
+			Constant c = expr.ResolveLabelConstant (ec);
 			if (c == null) {
-				ec.Report.Error (150, expr.Location, "A constant value is expected");
 				return false;
 			}
 
-			Type type = ec.Switch.SwitchType;
-			Constant res = c.TryReduce (ec, type, c.Location);
-			if (res == null) {
-				c.Error_ValueCannotBeConverted (ec, loc, type, true);
-				return false;
+			Constant res;
+			if (ec.Switch.IsNullable && c is NullLiteral) {
+				res = c;
+			} else {
+				TypeSpec type = ec.Switch.SwitchType;
+				res = c.Reduce (ec, type);
+				if (res == null) {
+					c.Error_ValueCannotBeConverted (ec, type, true);
+					return false;
+				}
+
+				if (!Convert.ImplicitStandardConversionExists (c, type))
+					ec.Report.Warning (469, 2, loc,
+						"The `goto case' value is not implicitly convertible to type `{0}'",
+						type.GetSignatureForError ());
+
 			}
 
-			if (!Convert.ImplicitStandardConversionExists (c, type))
-				ec.Report.Warning (469, 2, loc,
-					"The `goto case' value is not implicitly convertible to type `{0}'",
-					TypeManager.CSharpName (type));
-
-			object val = res.GetValue ();
-			if (val == null)
-				val = SwitchLabel.NullStringCase;
-					
-			sl = (SwitchLabel) ec.Switch.Elements [val];
-
-			if (sl == null){
-				FlowBranchingBlock.Error_UnknownLabel (loc, "case " + 
-					(c.GetValue () == null ? "null" : val.ToString ()), ec.Report);
-				return false;
-			}
+			ec.Switch.RegisterGotoCase (this, res);
+			base.Resolve (ec);
+			expr = res;
 
 			return true;
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			ec.ig.Emit (OpCodes.Br, sl.GetILLabelCode (ec));
-		}
-
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-		{
-			expr.MutateHoistedGenericType (storey);
+			ec.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, Label.GetILLabel (ec));
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -1039,6 +1698,66 @@ namespace Mono.CSharp {
 			GotoCase target = (GotoCase) t;
 
 			target.expr = expr.Clone (clonectx);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (!rc.IsUnreachable) {
+				var label = switch_statement.FindLabel ((Constant) expr);
+				if (label.IsUnreachable) {
+					label.MarkReachable (rc);
+					switch_statement.Block.ScanGotoJump (label);
+				}
+			}
+
+			return base.MarkReachable (rc);
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+	}
+
+	public abstract class SwitchGoto : Statement
+	{
+		protected bool unwind_protect;
+		protected Switch switch_statement;
+
+		protected SwitchGoto (Location loc)
+		{
+			this.loc = loc;
+		}
+
+		protected override void CloneTo (CloneContext clonectx, Statement target)
+		{
+			// Nothing to clone
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			CheckExitBoundaries (bc, bc.Switch.Block);
+
+			unwind_protect = bc.HasAny (ResolveContext.Options.TryScope | ResolveContext.Options.CatchScope);
+			switch_statement = bc.Switch;
+
+			return true;
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			return true;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			return Reachability.CreateUnreachable ();
+		}
+
+		protected void Error_GotoCaseRequiresSwitchBlock (BlockContext bc)
+		{
+			bc.Report.Error (153, loc, "A goto case is only valid inside a switch statement");
 		}
 	}
 	
@@ -1051,21 +1770,38 @@ namespace Mono.CSharp {
 			loc = l;
 		}
 
+		public Expression Expr {
+			get {
+ 				return this.expr;
+			}
+		}
+
 		public override bool Resolve (BlockContext ec)
 		{
 			if (expr == null) {
-				ec.CurrentBranching.CurrentUsageVector.Goto ();
-				return ec.CurrentBranching.CheckRethrow (loc);
+				if (!ec.HasSet (ResolveContext.Options.CatchScope)) {
+					ec.Report.Error (156, loc, "A throw statement with no arguments is not allowed outside of a catch clause");
+				} else if (ec.HasSet (ResolveContext.Options.FinallyScope)) {
+					for (var b = ec.CurrentBlock; b != null && !b.IsCatchBlock; b = b.Parent) {
+						if (b.IsFinallyBlock) {
+							ec.Report.Error (724, loc,
+								"A throw statement with no arguments is not allowed inside of a finally clause nested inside of the innermost catch clause");
+							break;
+						}
+					}
+				}
+
+				return true;
 			}
 
 			expr = expr.Resolve (ec, ResolveFlags.Type | ResolveFlags.VariableOrValue);
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
 
 			if (expr == null)
 				return false;
 
-			if (Convert.ImplicitConversionExists (ec, expr, TypeManager.exception_type))
-				expr = Convert.ImplicitConversion (ec, expr, TypeManager.exception_type, loc);
+			var et = ec.BuiltinTypes.Exception;
+			if (Convert.ImplicitConversionExists (ec, expr, et))
+				expr = Convert.ImplicitConversion (ec, expr, et, loc);
 			else
 				ec.Report.Error (155, expr.Location, "The type caught or thrown must be derived from System.Exception");
 
@@ -1074,19 +1810,38 @@ namespace Mono.CSharp {
 			
 		protected override void DoEmit (EmitContext ec)
 		{
-			if (expr == null)
-				ec.ig.Emit (OpCodes.Rethrow);
-			else {
+			if (expr == null) {
+				var atv = ec.AsyncThrowVariable;
+				if (atv != null) {
+					if (atv.HoistedVariant != null) {
+						atv.HoistedVariant.Emit (ec);
+					} else {
+						atv.Emit (ec);
+					}
+
+					ec.Emit (OpCodes.Throw);
+				} else {
+					ec.Emit (OpCodes.Rethrow);
+				}
+			} else {
 				expr.Emit (ec);
 
-				ec.ig.Emit (OpCodes.Throw);
+				ec.Emit (OpCodes.Throw);
 			}
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
 			if (expr != null)
-				expr.MutateHoistedGenericType (storey);
+				expr.FlowAnalysis (fc);
+
+			return true;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			return Reachability.CreateUnreachable ();
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -1096,67 +1851,137 @@ namespace Mono.CSharp {
 			if (expr != null)
 				target.expr = expr.Clone (clonectx);
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
 
-	public class Break : Statement {
-		
+	public class Break : LocalExitStatement
+	{		
 		public Break (Location l)
+			: base (l)
 		{
-			loc = l;
 		}
-
-		bool unwind_protect;
-
-		public override bool Resolve (BlockContext ec)
+		
+		public override object Accept (StructuralVisitor visitor)
 		{
-			unwind_protect = ec.CurrentBranching.AddBreakOrigin (ec.CurrentBranching.CurrentUsageVector, loc);
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
-			return true;
+			return visitor.Visit (this);
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			ec.ig.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, ec.LoopEnd);
+			var l = ec.LoopEnd;
+
+			if (ec.TryFinallyUnwind != null) {
+				var async_body = (AsyncInitializer) ec.CurrentAnonymousMethod;
+				l = TryFinally.EmitRedirectedJump (ec, async_body, l, enclosing_loop.Statement as Block);
+			}
+
+			ec.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, l);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
+			enclosing_loop.AddEndDefiniteAssignment (fc);
+			return true;
 		}
-		
-		protected override void CloneTo (CloneContext clonectx, Statement t)
+
+		protected override bool DoResolve (BlockContext bc)
 		{
-			// nothing needed
+			enclosing_loop = bc.EnclosingLoopOrSwitch;
+			return base.DoResolve (bc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			if (!rc.IsUnreachable)
+				enclosing_loop.SetEndReachable ();
+
+			return Reachability.CreateUnreachable ();
 		}
 	}
 
-	public class Continue : Statement {
-		
+	public class Continue : LocalExitStatement
+	{		
 		public Continue (Location l)
+			: base (l)
 		{
-			loc = l;
 		}
 
-		bool unwind_protect;
-
-		public override bool Resolve (BlockContext ec)
+		public override object Accept (StructuralVisitor visitor)
 		{
-			unwind_protect = ec.CurrentBranching.AddContinueOrigin (ec.CurrentBranching.CurrentUsageVector, loc);
-			ec.CurrentBranching.CurrentUsageVector.Goto ();
-			return true;
+			return visitor.Visit (this);
 		}
+
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			ec.ig.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, ec.LoopBegin);
+			var l = ec.LoopBegin;
+
+			if (ec.TryFinallyUnwind != null) {
+				var async_body = (AsyncInitializer) ec.CurrentAnonymousMethod;
+				l = TryFinally.EmitRedirectedJump (ec, async_body, l, enclosing_loop.Statement as Block);
+			}
+
+			ec.Emit (unwind_protect ? OpCodes.Leave : OpCodes.Br, l);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoResolve (BlockContext bc)
 		{
+			enclosing_loop = bc.EnclosingLoop;
+			return base.DoResolve (bc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			if (!rc.IsUnreachable)
+				enclosing_loop.SetIteratorReachable ();
+
+			return Reachability.CreateUnreachable ();
+		}
+	}
+
+	public abstract class LocalExitStatement : ExitStatement
+	{
+		protected LoopStatement enclosing_loop;
+
+		protected LocalExitStatement (Location loc)
+		{
+			this.loc = loc;
+		}
+
+		protected override bool IsLocalExit {
+			get {
+				return true;
+			}
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			// nothing needed.
+		}
+
+		protected override bool DoResolve (BlockContext bc)
+		{
+			if (enclosing_loop == null) {
+				bc.Report.Error (139, loc, "No enclosing loop out of which to break or continue");
+				return false;
+			}
+
+			var block = enclosing_loop.Statement as Block;
+
+			// Don't need to do extra checks for simple statements loops
+			if (block != null) {
+				CheckExitBoundaries (bc, block);
+			}
+
+			return true;
 		}
 	}
 
@@ -1167,231 +1992,649 @@ namespace Mono.CSharp {
 		void EmitAddressOf (EmitContext ec);
 	}
 
-	public interface IKnownVariable {
+	public interface INamedBlockVariable
+	{
 		Block Block { get; }
+		Expression CreateReferenceExpression (ResolveContext rc, Location loc);
+		bool IsDeclared { get; }
+		bool IsParameter { get; }
 		Location Location { get; }
+	}
+
+	public class BlockVariableDeclarator
+	{
+		LocalVariable li;
+		Expression initializer;
+
+		public BlockVariableDeclarator (LocalVariable li, Expression initializer)
+		{
+			if (li.Type != null)
+				throw new ArgumentException ("Expected null variable type");
+
+			this.li = li;
+			this.initializer = initializer;
+		}
+
+		#region Properties
+
+		public LocalVariable Variable {
+			get {
+				return li;
+			}
+		}
+
+		public Expression Initializer {
+			get {
+				return initializer;
+			}
+			set {
+				initializer = value;
+			}
+		}
+
+		#endregion
+
+		public virtual BlockVariableDeclarator Clone (CloneContext cloneCtx)
+		{
+			var t = (BlockVariableDeclarator) MemberwiseClone ();
+			if (initializer != null)
+				t.initializer = initializer.Clone (cloneCtx);
+
+			return t;
+		}
+	}
+
+	public class BlockVariable : Statement
+	{
+		Expression initializer;
+		protected FullNamedExpression type_expr;
+		protected LocalVariable li;
+		protected List<BlockVariableDeclarator> declarators;
+		TypeSpec type;
+
+		public BlockVariable (FullNamedExpression type, LocalVariable li)
+		{
+			this.type_expr = type;
+			this.li = li;
+			this.loc = type_expr.Location;
+		}
+
+		protected BlockVariable (LocalVariable li)
+		{
+			this.li = li;
+		}
+
+		#region Properties
+
+		public List<BlockVariableDeclarator> Declarators {
+			get {
+				return declarators;
+			}
+		}
+
+		public Expression Initializer {
+			get {
+				return initializer;
+			}
+			set {
+				initializer = value;
+			}
+		}
+
+		public FullNamedExpression TypeExpression {
+			get {
+				return type_expr;
+			}
+		}
+
+		public LocalVariable Variable {
+			get {
+				return li;
+			}
+		}
+
+		#endregion
+
+		public void AddDeclarator (BlockVariableDeclarator decl)
+		{
+			if (declarators == null)
+				declarators = new List<BlockVariableDeclarator> ();
+
+			declarators.Add (decl);
+		}
+
+		static void CreateEvaluatorVariable (BlockContext bc, LocalVariable li)
+		{
+			if (bc.Report.Errors != 0)
+				return;
+
+			var container = bc.CurrentMemberDefinition.Parent.PartialContainer;
+
+			Field f = new Field (container, new TypeExpression (li.Type, li.Location), Modifiers.PUBLIC | Modifiers.STATIC,
+				new MemberName (li.Name, li.Location), null);
+
+			container.AddField (f);
+			f.Define ();
+
+			li.HoistedVariant = new HoistedEvaluatorVariable (f);
+			li.SetIsUsed ();
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			return Resolve (bc, true);
+		}
+
+		public bool Resolve (BlockContext bc, bool resolveDeclaratorInitializers)
+		{
+			if (type == null && !li.IsCompilerGenerated) {
+				var vexpr = type_expr as VarExpr;
+
+				//
+				// C# 3.0 introduced contextual keywords (var) which behaves like a type if type with
+				// same name exists or as a keyword when no type was found
+				//
+				if (vexpr != null && !vexpr.IsPossibleTypeOrNamespace (bc)) {
+					if (bc.Module.Compiler.Settings.Version < LanguageVersion.V_3)
+						bc.Report.FeatureIsNotAvailable (bc.Module.Compiler, loc, "implicitly typed local variable");
+
+					if (li.IsFixed) {
+						bc.Report.Error (821, loc, "A fixed statement cannot use an implicitly typed local variable");
+						return false;
+					}
+
+					if (li.IsConstant) {
+						bc.Report.Error (822, loc, "An implicitly typed local variable cannot be a constant");
+						return false;
+					}
+
+					if (Initializer == null) {
+						bc.Report.Error (818, loc, "An implicitly typed local variable declarator must include an initializer");
+						return false;
+					}
+
+					if (declarators != null) {
+						bc.Report.Error (819, loc, "An implicitly typed local variable declaration cannot include multiple declarators");
+						declarators = null;
+					}
+
+					Initializer = Initializer.Resolve (bc);
+					if (Initializer != null) {
+						((VarExpr) type_expr).InferType (bc, Initializer);
+						type = type_expr.Type;
+					} else {
+						// Set error type to indicate the var was placed correctly but could
+						// not be infered
+						//
+						// var a = missing ();
+						//
+						type = InternalType.ErrorType;
+					}
+				}
+
+				if (type == null) {
+					type = type_expr.ResolveAsType (bc);
+					if (type == null)
+						return false;
+
+					if (li.IsConstant && !type.IsConstantCompatible) {
+						Const.Error_InvalidConstantType (type, loc, bc.Report);
+					}
+				}
+
+				if (type.IsStatic)
+					FieldBase.Error_VariableOfStaticClass (loc, li.Name, type, bc.Report);
+
+				li.Type = type;
+			}
+
+			bool eval_global = bc.Module.Compiler.Settings.StatementMode && bc.CurrentBlock is ToplevelBlock;
+			if (eval_global) {
+				CreateEvaluatorVariable (bc, li);
+			} else if (type != InternalType.ErrorType) {
+				li.PrepareAssignmentAnalysis (bc);
+			}
+
+			if (initializer != null) {
+				initializer = ResolveInitializer (bc, li, initializer);
+				// li.Variable.DefinitelyAssigned 
+			}
+
+			if (declarators != null) {
+				foreach (var d in declarators) {
+					d.Variable.Type = li.Type;
+					if (eval_global) {
+						CreateEvaluatorVariable (bc, d.Variable);
+					} else if (type != InternalType.ErrorType) {
+						d.Variable.PrepareAssignmentAnalysis (bc);
+					}
+
+					if (d.Initializer != null && resolveDeclaratorInitializers) {
+						d.Initializer = ResolveInitializer (bc, d.Variable, d.Initializer);
+						// d.Variable.DefinitelyAssigned 
+					} 
+				}
+			}
+
+			return true;
+		}
+
+		protected virtual Expression ResolveInitializer (BlockContext bc, LocalVariable li, Expression initializer)
+		{
+			var a = new SimpleAssign (li.CreateReferenceExpression (bc, li.Location), initializer, li.Location);
+			return a.ResolveStatement (bc);
+		}
+
+		protected override void DoEmit (EmitContext ec)
+		{
+			li.CreateBuilder (ec);
+
+			if (Initializer != null && !IsUnreachable)
+				((ExpressionStatement) Initializer).EmitStatement (ec);
+
+			if (declarators != null) {
+				foreach (var d in declarators) {
+					d.Variable.CreateBuilder (ec);
+					if (d.Initializer != null && !IsUnreachable) {
+						ec.Mark (d.Variable.Location);
+						((ExpressionStatement) d.Initializer).EmitStatement (ec);
+					}
+				}
+			}
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			if (Initializer != null)
+				Initializer.FlowAnalysis (fc);
+
+			if (declarators != null) {
+				foreach (var d in declarators) {
+					if (d.Initializer != null)
+						d.Initializer.FlowAnalysis (fc);
+				}
+			}
+
+			return false;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			var init = initializer as ExpressionStatement;
+			if (init != null)
+				init.MarkReachable (rc);
+
+			return base.MarkReachable (rc);
+		}
+
+		protected override void CloneTo (CloneContext clonectx, Statement target)
+		{
+			BlockVariable t = (BlockVariable) target;
+
+			if (type_expr != null)
+				t.type_expr = (FullNamedExpression) type_expr.Clone (clonectx);
+
+			if (initializer != null)
+				t.initializer = initializer.Clone (clonectx);
+
+			if (declarators != null) {
+				t.declarators = null;
+				foreach (var d in declarators)
+					t.AddDeclarator (d.Clone (clonectx));
+			}
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+	}
+
+	public class BlockConstant : BlockVariable
+	{
+		public BlockConstant (FullNamedExpression type, LocalVariable li)
+			: base (type, li)
+		{
+		}
+
+		public override void Emit (EmitContext ec)
+		{
+			// Nothing to emit, not even sequence point
+		}
+
+		protected override Expression ResolveInitializer (BlockContext bc, LocalVariable li, Expression initializer)
+		{
+			initializer = initializer.Resolve (bc);
+			if (initializer == null)
+				return null;
+
+			var c = initializer as Constant;
+			if (c == null) {
+				initializer.Error_ExpressionMustBeConstant (bc, initializer.Location, li.Name);
+				return null;
+			}
+
+			c = c.ConvertImplicitly (li.Type);
+			if (c == null) {
+				if (TypeSpec.IsReferenceType (li.Type))
+					initializer.Error_ConstantCanBeInitializedWithNullOnly (bc, li.Type, initializer.Location, li.Name);
+				else
+					initializer.Error_ValueCannotBeConverted (bc, li.Type, false);
+
+				return null;
+			}
+
+			li.ConstantValue = c;
+			return initializer;
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
 
 	//
 	// The information about a user-perceived local variable
 	//
-	public class LocalInfo : IKnownVariable, ILocalVariable {
-		public readonly FullNamedExpression Type;
+	public sealed class LocalVariable : INamedBlockVariable, ILocalVariable
+	{
+		[Flags]
+		public enum Flags
+		{
+			Used = 1,
+			IsThis = 1 << 1,
+			AddressTaken = 1 << 2,
+			CompilerGenerated = 1 << 3,
+			Constant = 1 << 4,
+			ForeachVariable = 1 << 5,
+			FixedVariable = 1 << 6,
+			UsingVariable = 1 << 7,
+			IsLocked = 1 << 8,
 
-		public Type VariableType;
-		public readonly string Name;
-		public readonly Location Location;
-		public readonly Block Block;
+			ReadonlyMask = ForeachVariable | FixedVariable | UsingVariable
+		}
+
+		TypeSpec type;
+		readonly string name;
+		readonly Location loc;
+		readonly Block block;
+		Flags flags;
+		Constant const_value;
 
 		public VariableInfo VariableInfo;
-		public HoistedVariable HoistedVariableReference;
+		HoistedVariable hoisted_variant;
 
-		[Flags]
-		enum Flags : byte {
-			Used = 1,
-			ReadOnly = 2,
-			Pinned = 4,
-			IsThis = 8,
-			AddressTaken = 32,
-			CompilerGenerated = 64,
-			IsConstant = 128
-		}
-
-		public enum ReadOnlyContext: byte {
-			Using,
-			Foreach,
-			Fixed
-		}
-
-		Flags flags;
-		ReadOnlyContext ro_context;
 		LocalBuilder builder;
 
-		public LocalInfo (FullNamedExpression type, string name, Block block, Location l)
+		public LocalVariable (Block block, string name, Location loc)
 		{
-			Type = type;
-			Name = name;
-			Block = block;
-			Location = l;
+			this.block = block;
+			this.name = name;
+			this.loc = loc;
 		}
 
-		public LocalInfo (DeclSpace ds, Block block, Location l)
+		public LocalVariable (Block block, string name, Flags flags, Location loc)
+			: this (block, name, loc)
 		{
-			VariableType = ds.IsGeneric ? ds.CurrentType : ds.TypeBuilder;
-			Block = block;
-			Location = l;
+			this.flags = flags;
 		}
 
-		public void ResolveVariable (EmitContext ec)
+		//
+		// Used by variable declarators
+		//
+		public LocalVariable (LocalVariable li, string name, Location loc)
+			: this (li.block, name, li.flags, loc)
 		{
-			if (HoistedVariableReference != null)
+		}
+
+		#region Properties
+
+		public bool AddressTaken {
+			get {
+				return (flags & Flags.AddressTaken) != 0;
+			}
+		}
+
+		public Block Block {
+			get {
+				return block;
+			}
+		}
+
+		public Constant ConstantValue {
+			get {
+				return const_value;
+			}
+			set {
+				const_value = value;
+			}
+		}
+
+		//
+		// Hoisted local variable variant
+		//
+		public HoistedVariable HoistedVariant {
+			get {
+				return hoisted_variant;
+			}
+			set {
+				hoisted_variant = value;
+			}
+		}
+
+		public bool IsDeclared {
+			get {
+				return type != null;
+			}
+		}
+
+		public bool IsCompilerGenerated {
+			get {
+				return (flags & Flags.CompilerGenerated) != 0;
+			}
+		}
+
+		public bool IsConstant {
+			get {
+				return (flags & Flags.Constant) != 0;
+			}
+		}
+
+		public bool IsLocked {
+			get {
+				return (flags & Flags.IsLocked) != 0;
+			}
+			set {
+				flags = value ? flags | Flags.IsLocked : flags & ~Flags.IsLocked;
+			}
+		}
+
+		public bool IsThis {
+			get {
+				return (flags & Flags.IsThis) != 0;
+			}
+		}
+
+		public bool IsFixed {
+			get {
+				return (flags & Flags.FixedVariable) != 0;
+			}
+		}
+
+		bool INamedBlockVariable.IsParameter {
+			get {
+				return false;
+			}
+		}
+
+		public bool IsReadonly {
+			get {
+				return (flags & Flags.ReadonlyMask) != 0;
+			}
+		}
+
+		public Location Location {
+			get {
+				return loc;
+			}
+		}
+
+		public string Name {
+			get {
+				return name;
+			}
+		}
+
+		public TypeSpec Type {
+		    get {
+				return type;
+			}
+		    set {
+				type = value;
+			}
+		}
+
+		#endregion
+
+		public void CreateBuilder (EmitContext ec)
+		{
+			if ((flags & Flags.Used) == 0) {
+				if (VariableInfo == null) {
+					// Missing flow analysis or wrong variable flags
+					throw new InternalErrorException ("VariableInfo is null and the variable `{0}' is not used", name);
+				}
+
+				if (VariableInfo.IsEverAssigned)
+					ec.Report.Warning (219, 3, Location, "The variable `{0}' is assigned but its value is never used", Name);
+				else
+					ec.Report.Warning (168, 3, Location, "The variable `{0}' is declared but never used", Name);
+			}
+
+			if (HoistedVariant != null)
 				return;
 
-			if (builder == null) {
-				if (Pinned)
-					//
-					// This is needed to compile on both .NET 1.x and .NET 2.x
-					// the later introduced `DeclareLocal (Type t, bool pinned)'
-					//
-					builder = TypeManager.DeclareLocalPinned (ec.ig, VariableType);
-				else
-					builder = ec.ig.DeclareLocal (TypeManager.TypeToReflectionType (VariableType));
+			if (builder != null) {
+				if ((flags & Flags.CompilerGenerated) != 0)
+					return;
+
+				// To avoid Used warning duplicates
+				throw new InternalErrorException ("Already created variable `{0}'", name);
 			}
+
+			//
+			// All fixed variabled are pinned, a slot has to be alocated
+			//
+			builder = ec.DeclareLocal (Type, IsFixed);
+			if (!ec.HasSet (BuilderContext.Options.OmitDebugInfo) && (flags & Flags.CompilerGenerated) == 0)
+				ec.DefineLocalVariable (name, builder);
+		}
+
+		public static LocalVariable CreateCompilerGenerated (TypeSpec type, Block block, Location loc)
+		{
+			LocalVariable li = new LocalVariable (block, GetCompilerGeneratedName (block), Flags.CompilerGenerated | Flags.Used, loc);
+			li.Type = type;
+			return li;
+		}
+
+		public Expression CreateReferenceExpression (ResolveContext rc, Location loc)
+		{
+			if (IsConstant && const_value != null)
+				return Constant.CreateConstantFromValue (Type, const_value.GetValue (), loc);
+
+			return new LocalVariableReference (this, loc);
 		}
 
 		public void Emit (EmitContext ec)
 		{
-			ec.ig.Emit (OpCodes.Ldloc, builder);
+			// TODO: Need something better for temporary variables
+			if ((flags & Flags.CompilerGenerated) != 0)
+				CreateBuilder (ec);
+
+			ec.Emit (OpCodes.Ldloc, builder);
 		}
 
 		public void EmitAssign (EmitContext ec)
 		{
-			ec.ig.Emit (OpCodes.Stloc, builder);
+			// TODO: Need something better for temporary variables
+			if ((flags & Flags.CompilerGenerated) != 0)
+				CreateBuilder (ec);
+
+			ec.Emit (OpCodes.Stloc, builder);
 		}
 
 		public void EmitAddressOf (EmitContext ec)
 		{
-			ec.ig.Emit (OpCodes.Ldloca, builder);
+			// TODO: Need something better for temporary variables
+			if ((flags & Flags.CompilerGenerated) != 0)
+				CreateBuilder (ec);
+
+			ec.Emit (OpCodes.Ldloca, builder);
 		}
 
-		public void EmitSymbolInfo (EmitContext ec)
+		public static string GetCompilerGeneratedName (Block block)
 		{
-			if (builder != null)
-				ec.DefineLocalVariable (Name, builder);
-		}
-
-		public bool IsThisAssigned (BlockContext ec, Block block)
-		{
-			if (VariableInfo == null)
-				throw new Exception ();
-
-			if (!ec.DoFlowAnalysis || ec.CurrentBranching.IsAssigned (VariableInfo))
-				return true;
-
-			return VariableInfo.TypeInfo.IsFullyInitialized (ec, VariableInfo, block.StartLocation);
-		}
-
-		public bool IsAssigned (BlockContext ec)
-		{
-			if (VariableInfo == null)
-				throw new Exception ();
-
-			return !ec.DoFlowAnalysis || ec.CurrentBranching.IsAssigned (VariableInfo);
-		}
-
-		public bool Resolve (ResolveContext ec)
-		{
-			if (VariableType != null)
-				return true;
-
-			TypeExpr texpr = Type.ResolveAsContextualType (ec, false);
-			if (texpr == null)
-				return false;
-				
-			VariableType = texpr.Type;
-
-			if (TypeManager.IsGenericParameter (VariableType))
-				return true;
-
-			if (VariableType.IsAbstract && VariableType.IsSealed) {
-				FieldBase.Error_VariableOfStaticClass (Location, Name, VariableType, ec.Report);
-				return false;
-			}
-
-			if (VariableType.IsPointer && !ec.IsUnsafe)
-				Expression.UnsafeError (ec, Location);
-
-			return true;
-		}
-
-		public bool IsConstant {
-			get { return (flags & Flags.IsConstant) != 0; }
-			set { flags |= Flags.IsConstant; }
-		}
-
-		public bool AddressTaken {
-			get { return (flags & Flags.AddressTaken) != 0; }
-			set { flags |= Flags.AddressTaken; }
-		}
-
-		public bool CompilerGenerated {
-			get { return (flags & Flags.CompilerGenerated) != 0; }
-			set { flags |= Flags.CompilerGenerated; }
-		}
-
-		public override string ToString ()
-		{
-			return String.Format ("LocalInfo ({0},{1},{2},{3})",
-					      Name, Type, VariableInfo, Location);
-		}
-
-		public bool Used {
-			get { return (flags & Flags.Used) != 0; }
-			set { flags = value ? (flags | Flags.Used) : (unchecked (flags & ~Flags.Used)); }
-		}
-
-		public bool ReadOnly {
-			get { return (flags & Flags.ReadOnly) != 0; }
-		}
-
-		public void SetReadOnlyContext (ReadOnlyContext context)
-		{
-			flags |= Flags.ReadOnly;
-			ro_context = context;
+			// HACK: Debugger depends on the name semantics
+			return "$locvar" + block.ParametersBlock.TemporaryLocalsCount++.ToString ("X");
 		}
 
 		public string GetReadOnlyContext ()
 		{
-			if (!ReadOnly)
-				throw new InternalErrorException ("Variable is not readonly");
-
-			switch (ro_context) {
-			case ReadOnlyContext.Fixed:
+			switch (flags & Flags.ReadonlyMask) {
+			case Flags.FixedVariable:
 				return "fixed variable";
-			case ReadOnlyContext.Foreach:
+			case Flags.ForeachVariable:
 				return "foreach iteration variable";
-			case ReadOnlyContext.Using:
+			case Flags.UsingVariable:
 				return "using variable";
 			}
-			throw new NotImplementedException ();
+
+			throw new InternalErrorException ("Variable is not readonly");
 		}
 
-		//
-		// Whether the variable is pinned, if Pinned the variable has been 
-		// allocated in a pinned slot with DeclareLocal.
-		//
-		public bool Pinned {
-			get { return (flags & Flags.Pinned) != 0; }
-			set { flags = value ? (flags | Flags.Pinned) : (flags & ~Flags.Pinned); }
+		public bool IsThisAssigned (FlowAnalysisContext fc, Block block)
+		{
+			if (VariableInfo == null)
+				throw new Exception ();
+
+			if (IsAssigned (fc))
+				return true;
+
+			return VariableInfo.IsFullyInitialized (fc, block.StartLocation);
 		}
 
-		public bool IsThis {
-			get { return (flags & Flags.IsThis) != 0; }
-			set { flags = value ? (flags | Flags.IsThis) : (flags & ~Flags.IsThis); }
+		public bool IsAssigned (FlowAnalysisContext fc)
+		{
+			return fc.IsDefinitelyAssigned (VariableInfo);
 		}
 
-		Block IKnownVariable.Block {
-			get { return Block; }
-		}
-
-		Location IKnownVariable.Location {
-			get { return Location; }
-		}
-
-		public LocalInfo Clone (CloneContext clonectx)
+		public void PrepareAssignmentAnalysis (BlockContext bc)
 		{
 			//
-			// Variables in anonymous block are not resolved yet
+			// No need to run assignment analysis for these guys
 			//
-			if (VariableType == null)
-				return new LocalInfo ((FullNamedExpression) Type.Clone (clonectx), Name, clonectx.LookupBlock (Block), Location);
+			if ((flags & (Flags.Constant | Flags.ReadonlyMask | Flags.CompilerGenerated)) != 0)
+				return;
 
-			//
-			// Variables in method block are resolved
-			//
-			LocalInfo li = new LocalInfo (null, Name, clonectx.LookupBlock (Block), Location);
-			li.VariableType = VariableType;
-			return li;			
+			VariableInfo = VariableInfo.Create (bc, this);
+		}
+
+		//
+		// Mark the variables as referenced in the user code
+		//
+		public void SetIsUsed ()
+		{
+			flags |= Flags.Used;
+		}
+
+		public void SetHasAddressTaken ()
+		{
+			flags |= (Flags.AddressTaken | Flags.Used);
+		}
+
+		public override string ToString ()
+		{
+			return string.Format ("LocalInfo ({0},{1},{2},{3})", name, type, VariableInfo, Location);
 		}
 	}
 
@@ -1410,25 +2653,108 @@ namespace Mono.CSharp {
 	///   they contain extra information that is not necessary on normal blocks.
 	/// </remarks>
 	public class Block : Statement {
-		public Block    Parent;
+		[Flags]
+		public enum Flags
+		{
+			Unchecked = 1,
+			ReachableEnd = 8,
+			Unsafe = 16,
+			HasCapturedVariable = 64,
+			HasCapturedThis = 1 << 7,
+			IsExpressionTree = 1 << 8,
+			CompilerGenerated = 1 << 9,
+			HasAsyncModifier = 1 << 10,
+			Resolved = 1 << 11,
+			YieldBlock = 1 << 12,
+			AwaitBlock = 1 << 13,
+			FinallyBlock = 1 << 14,
+			CatchBlock = 1 << 15,
+			Iterator = 1 << 20,
+			NoFlowAnalysis = 1 << 21,
+			InitializationEmitted = 1 << 22
+		}
+
+		public Block Parent;
 		public Location StartLocation;
-		public Location EndLocation = Location.Null;
+		public Location EndLocation;
 
 		public ExplicitBlock Explicit;
-		public ToplevelBlock Toplevel; // TODO: Use Explicit
+		public ParametersBlock ParametersBlock;
 
-		[Flags]
-		public enum Flags : byte {
-			Unchecked = 1,
-			BlockUsed = 2,
-			VariablesInitialized = 4,
-			HasRet = 8,
-			Unsafe = 16,
-			IsIterator = 32,
-			HasCapturedVariable = 64,
-			HasCapturedThis = 128
-		}
 		protected Flags flags;
+
+		//
+		// The statements in this block
+		//
+		protected List<Statement> statements;
+
+		protected List<Statement> scope_initializers;
+
+		int? resolving_init_idx;
+
+		Block original;
+
+#if DEBUG
+		static int id;
+		public int ID = id++;
+
+		static int clone_id_counter;
+		int clone_id;
+#endif
+
+//		int assignable_slots;
+
+		public Block (Block parent, Location start, Location end)
+			: this (parent, 0, start, end)
+		{
+		}
+
+		public Block (Block parent, Flags flags, Location start, Location end)
+		{
+			if (parent != null) {
+				// the appropriate constructors will fixup these fields
+				ParametersBlock = parent.ParametersBlock;
+				Explicit = parent.Explicit;
+			}
+			
+			this.Parent = parent;
+			this.flags = flags;
+			this.StartLocation = start;
+			this.EndLocation = end;
+			this.loc = start;
+			statements = new List<Statement> (4);
+
+			this.original = this;
+		}
+
+		#region Properties
+
+		public Block Original {
+			get {
+				return original;
+			}
+			protected set {
+				original = value;
+			}
+		}
+
+		public bool IsCompilerGenerated {
+			get { return (flags & Flags.CompilerGenerated) != 0; }
+			set { flags = value ? flags | Flags.CompilerGenerated : flags & ~Flags.CompilerGenerated; }
+		}
+
+
+		public bool IsCatchBlock {
+			get {
+				return (flags & Flags.CatchBlock) != 0;
+			}
+		}
+
+		public bool IsFinallyBlock {
+			get {
+				return (flags & Flags.FinallyBlock) != 0;
+			}
+		}
 
 		public bool Unchecked {
 			get { return (flags & Flags.Unchecked) != 0; }
@@ -1440,448 +2766,61 @@ namespace Mono.CSharp {
 			set { flags |= Flags.Unsafe; }
 		}
 
-		//
-		// The statements in this block
-		//
-		protected ArrayList statements;
-
-		//
-		// An array of Blocks.  We keep track of children just
-		// to generate the local variable declarations.
-		//
-		// Statements and child statements are handled through the
-		// statements.
-		//
-		ArrayList children;
-
-		//
-		// Labels.  (label, block) pairs.
-		//
-		protected HybridDictionary labels;
-
-		//
-		// Keeps track of (name, type) pairs
-		//
-		IDictionary variables;
-
-		//
-		// Keeps track of constants
-		HybridDictionary constants;
-
-		//
-		// Temporary variables.
-		//
-		ArrayList temporary_variables;
-		
-		//
-		// If this is a switch section, the enclosing switch block.
-		//
-		Block switch_block;
-
-		protected ArrayList scope_initializers;
-
-		ArrayList anonymous_children;
-
-		protected static int id;
-
-		int this_id;
-
-		int assignable_slots;
-		bool unreachable_shown;
-		bool unreachable;
-		
-		public Block (Block parent)
-			: this (parent, (Flags) 0, Location.Null, Location.Null)
-		{ }
-
-		public Block (Block parent, Flags flags)
-			: this (parent, flags, Location.Null, Location.Null)
-		{ }
-
-		public Block (Block parent, Location start, Location end)
-			: this (parent, (Flags) 0, start, end)
-		{ }
-
-		//
-		// Useful when TopLevel block is downgraded to normal block
-		//
-		public Block (ToplevelBlock parent, ToplevelBlock source)
-			: this (parent, source.flags, source.StartLocation, source.EndLocation)
-		{
-			statements = source.statements;
-			children = source.children;
-			labels = source.labels;
-			variables = source.variables;
-			constants = source.constants;
-			switch_block = source.switch_block;
+		public List<Statement> Statements {
+			get { return statements; }
 		}
 
-		public Block (Block parent, Flags flags, Location start, Location end)
-		{
-			if (parent != null) {
-				parent.AddChild (this);
-
-				// the appropriate constructors will fixup these fields
-				Toplevel = parent.Toplevel;
-				Explicit = parent.Explicit;
-			}
-			
-			this.Parent = parent;
-			this.flags = flags;
-			this.StartLocation = start;
-			this.EndLocation = end;
-			this.loc = start;
-			this_id = id++;
-			statements = new ArrayList (4);
-		}
-
-		public Block CreateSwitchBlock (Location start)
-		{
-			// FIXME: should this be implicit?
-			Block new_block = new ExplicitBlock (this, start, start);
-			new_block.switch_block = this;
-			return new_block;
-		}
-
-		public int ID {
-			get { return this_id; }
-		}
-
-		public IDictionary Variables {
-			get {
-				if (variables == null)
-					variables = new ListDictionary ();
-				return variables;
-			}
-		}
-
-		void AddChild (Block b)
-		{
-			if (children == null)
-				children = new ArrayList (1);
-			
-			children.Add (b);
-		}
+		#endregion
 
 		public void SetEndLocation (Location loc)
 		{
 			EndLocation = loc;
 		}
 
-		protected void Error_158 (string name, Location loc)
+		public void AddLabel (LabeledStatement target)
 		{
-			Toplevel.Report.Error (158, loc, "The label `{0}' shadows another label " +
-				      "by the same name in a contained scope", name);
+			ParametersBlock.TopBlock.AddLabel (target.Name, target);
 		}
 
-		/// <summary>
-		///   Adds a label to the current block. 
-		/// </summary>
-		///
-		/// <returns>
-		///   false if the name already exists in this block. true
-		///   otherwise.
-		/// </returns>
-		///
-		public bool AddLabel (LabeledStatement target)
+		public void AddLocalName (LocalVariable li)
 		{
-			if (switch_block != null)
-				return switch_block.AddLabel (target);
-
-			string name = target.Name;
-
-			Block cur = this;
-			while (cur != null) {
-				LabeledStatement s = cur.DoLookupLabel (name);
-				if (s != null) {
-					Toplevel.Report.SymbolRelatedToPreviousError (s.loc, s.Name);
-					Toplevel.Report.Error (140, target.loc, "The label `{0}' is a duplicate", name);
-					return false;
-				}
-
-				if (this == Explicit)
-					break;
-
-				cur = cur.Parent;
-			}
-
-			while (cur != null) {
-				if (cur.DoLookupLabel (name) != null) {
-					Error_158 (name, target.loc);
-					return false;
-				}
-
-				if (children != null) {
-					foreach (Block b in children) {
-						LabeledStatement s = b.DoLookupLabel (name);
-						if (s == null)
-							continue;
-
-						Toplevel.Report.SymbolRelatedToPreviousError (s.loc, s.Name);
-						Error_158 (name, target.loc);
-						return false;
-					}
-				}
-
-				cur = cur.Parent;
-			}
-
-			Toplevel.CheckError158 (name, target.loc);
-
-			if (labels == null)
-				labels = new HybridDictionary();
-
-			labels.Add (name, target);
-			return true;
+			AddLocalName (li.Name, li);
 		}
 
-		public LabeledStatement LookupLabel (string name)
+		public void AddLocalName (string name, INamedBlockVariable li)
 		{
-			LabeledStatement s = DoLookupLabel (name);
-			if (s != null)
-				return s;
-
-			if (children == null)
-				return null;
-
-			foreach (Block child in children) {
-				if (Explicit != child.Explicit)
-					continue;
-
-				s = child.LookupLabel (name);
-				if (s != null)
-					return s;
-			}
-
-			return null;
+			ParametersBlock.TopBlock.AddLocalName (name, li, false);
 		}
 
-		LabeledStatement DoLookupLabel (string name)
-		{
-			if (switch_block != null)
-				return switch_block.LookupLabel (name);
-
-			if (labels != null)
-				if (labels.Contains (name))
-					return ((LabeledStatement) labels [name]);
-
-			return null;
-		}
-
-		public bool CheckInvariantMeaningInBlock (string name, Expression e, Location loc)
-		{
-			Block b = this;
-			IKnownVariable kvi = b.Explicit.GetKnownVariable (name);
-			while (kvi == null) {
-				b = b.Explicit.Parent;
-				if (b == null)
-					return true;
-				kvi = b.Explicit.GetKnownVariable (name);
-			}
-
-			if (kvi.Block == b)
-				return true;
-
-			// Is kvi.Block nested inside 'b'
-			if (b.Explicit != kvi.Block.Explicit) {
-				//
-				// If a variable by the same name it defined in a nested block of this
-				// block, we violate the invariant meaning in a block.
-				//
-				if (b == this) {
-					Toplevel.Report.SymbolRelatedToPreviousError (kvi.Location, name);
-					Toplevel.Report.Error (135, loc, "`{0}' conflicts with a declaration in a child block", name);
-					return false;
-				}
-
-				//
-				// It's ok if the definition is in a nested subblock of b, but not
-				// nested inside this block -- a definition in a sibling block
-				// should not affect us.
-				//
-				return true;
-			}
-
-			//
-			// Block 'b' and kvi.Block are the same textual block.
-			// However, different variables are extant.
-			//
-			// Check if the variable is in scope in both blocks.  We use
-			// an indirect check that depends on AddVariable doing its
-			// part in maintaining the invariant-meaning-in-block property.
-			//
-			if (e is VariableReference || (e is Constant && b.GetLocalInfo (name) != null))
-				return true;
-
-			if (this is ToplevelBlock) {
-				Toplevel.Report.SymbolRelatedToPreviousError (kvi.Location, name);
-				e.Error_VariableIsUsedBeforeItIsDeclared (Toplevel.Report, name);
-				return false;
-			}
-
-			//
-			// Even though we detected the error when the name is used, we
-			// treat it as if the variable declaration was in error.
-			//
-			Toplevel.Report.SymbolRelatedToPreviousError (loc, name);
-			Error_AlreadyDeclared (kvi.Location, name, "parent or current");
-			return false;
-		}
-
-		protected virtual bool CheckParentConflictName (ToplevelBlock block, string name, Location l)
-		{
-			LocalInfo vi = GetLocalInfo (name);
-			if (vi != null) {
-				block.Report.SymbolRelatedToPreviousError (vi.Location, name);
-				if (Explicit == vi.Block.Explicit) {
-					Error_AlreadyDeclared (l, name, null);
-				} else {
-					Error_AlreadyDeclared (l, name, this is ToplevelBlock ?
-						"parent or current" : "parent");
-				}
-				return false;
-			}
-
-			if (block != null) {
-				Expression e = block.GetParameterReference (name, Location.Null);
-				if (e != null) {
-					ParameterReference pr = e as ParameterReference;
-					if (this is Linq.QueryBlock && (pr != null && pr.Parameter is Linq.QueryBlock.ImplicitQueryParameter || e is MemberAccess))
-						Error_AlreadyDeclared (loc, name);
-					else
-						Error_AlreadyDeclared (loc, name, "parent or current");
-					return false;
-				}
-			}
-
-			return true;
-		}
-
-		public LocalInfo AddVariable (Expression type, string name, Location l)
-		{
-			if (!CheckParentConflictName (Toplevel, name, l))
-				return null;
-
-			if (Toplevel.GenericMethod != null) {
-				foreach (TypeParameter tp in Toplevel.GenericMethod.CurrentTypeParameters) {
-					if (tp.Name == name) {
-						Toplevel.Report.SymbolRelatedToPreviousError (tp);
-						Error_AlreadyDeclaredTypeParameter (Toplevel.Report, loc, name, "local variable");
-						return null;
-					}
-				}
-			}			
-
-			IKnownVariable kvi = Explicit.GetKnownVariable (name);
-			if (kvi != null) {
-				Toplevel.Report.SymbolRelatedToPreviousError (kvi.Location, name);
-				Error_AlreadyDeclared (l, name, "child");
-				return null;
-			}
-
-			LocalInfo vi = new LocalInfo ((FullNamedExpression) type, name, this, l);
-			AddVariable (vi);
-
-			if ((flags & Flags.VariablesInitialized) != 0)
-				throw new InternalErrorException ("block has already been resolved");
-
-			return vi;
-		}
-		
-		protected virtual void AddVariable (LocalInfo li)
-		{
-			Variables.Add (li.Name, li);
-			Explicit.AddKnownVariable (li.Name, li);
-		}
-
-		protected virtual void Error_AlreadyDeclared (Location loc, string var, string reason)
+		public virtual void Error_AlreadyDeclared (string name, INamedBlockVariable variable, string reason)
 		{
 			if (reason == null) {
-				Error_AlreadyDeclared (loc, var);
+				Error_AlreadyDeclared (name, variable);
 				return;
 			}
-			
-			Toplevel.Report.Error (136, loc, "A local variable named `{0}' cannot be declared " +
-				      "in this scope because it would give a different meaning " +
-				      "to `{0}', which is already used in a `{1}' scope " +
-				      "to denote something else", var, reason);
+
+			ParametersBlock.TopBlock.Report.Error (136, variable.Location,
+				"A local variable named `{0}' cannot be declared in this scope because it would give a different meaning " +
+				"to `{0}', which is already used in a `{1}' scope to denote something else",
+				name, reason);
 		}
 
-		protected virtual void Error_AlreadyDeclared (Location loc, string name)
+		public virtual void Error_AlreadyDeclared (string name, INamedBlockVariable variable)
 		{
-			Toplevel.Report.Error (128, loc,
-				"A local variable named `{0}' is already defined in this scope", name);
+			var pi = variable as ParametersBlock.ParameterInfo;
+			if (pi != null) {
+				pi.Parameter.Error_DuplicateName (ParametersBlock.TopBlock.Report);
+			} else {
+				ParametersBlock.TopBlock.Report.Error (128, variable.Location,
+					"A local variable named `{0}' is already defined in this scope", name);
+			}
 		}
 					
-		public virtual void Error_AlreadyDeclaredTypeParameter (Report r, Location loc, string name, string conflict)
+		public virtual void Error_AlreadyDeclaredTypeParameter (string name, Location loc)
 		{
-			r.Error (412, loc, "The type parameter name `{0}' is the same as `{1}'",
-				name, conflict);
-		}
-
-		public bool AddConstant (Expression type, string name, Expression value, Location l)
-		{
-			if (AddVariable (type, name, l) == null)
-				return false;
-			
-			if (constants == null)
-				constants = new HybridDictionary();
-
-			constants.Add (name, value);
-
-			// A block is considered used if we perform an initialization in a local declaration, even if it is constant.
-			Use ();
-			return true;
-		}
-
-		static int next_temp_id = 0;
-
-		public LocalInfo AddTemporaryVariable (TypeExpr te, Location loc)
-		{
-			Report.Debug (64, "ADD TEMPORARY", this, Toplevel, loc);
-
-			if (temporary_variables == null)
-				temporary_variables = new ArrayList ();
-
-			int id = ++next_temp_id;
-			string name = "$s_" + id.ToString ();
-
-			LocalInfo li = new LocalInfo (te, name, this, loc);
-			li.CompilerGenerated = true;
-			temporary_variables.Add (li);
-			return li;
-		}
-
-		public LocalInfo GetLocalInfo (string name)
-		{
-			LocalInfo ret;
-			for (Block b = this; b != null; b = b.Parent) {
-				if (b.variables != null) {
-					ret = (LocalInfo) b.variables [name];
-					if (ret != null)
-						return ret;
-				}
-			}
-
-			return null;
-		}
-
-		public Expression GetVariableType (string name)
-		{
-			LocalInfo vi = GetLocalInfo (name);
-			return vi == null ? null : vi.Type;
-		}
-
-		public Expression GetConstantExpression (string name)
-		{
-			for (Block b = this; b != null; b = b.Parent) {
-				if (b.constants != null) {
-					Expression ret = b.constants [name] as Expression;
-					if (ret != null)
-						return ret;
-				}
-			}
-			return null;
+			ParametersBlock.TopBlock.Report.Error (412, loc,
+				"The type parameter name `{0}' is the same as local variable or parameter name",
+				name);
 		}
 
 		//
@@ -1891,343 +2830,112 @@ namespace Mono.CSharp {
 		public void AddScopeStatement (Statement s)
 		{
 			if (scope_initializers == null)
-				scope_initializers = new ArrayList ();
+				scope_initializers = new List<Statement> ();
 
-			scope_initializers.Add (s);
+			//
+			// Simple recursive helper, when resolve scope initializer another
+			// new scope initializer can be added, this ensures it's initialized
+			// before existing one. For now this can happen with expression trees
+			// in base ctor initializer only
+			//
+			if (resolving_init_idx.HasValue) {
+				scope_initializers.Insert (resolving_init_idx.Value, s);
+				++resolving_init_idx;
+			} else {
+				scope_initializers.Add (s);
+			}
+		}
+
+		public void InsertStatement (int index, Statement s)
+		{
+			statements.Insert (index, s);
 		}
 		
 		public void AddStatement (Statement s)
 		{
 			statements.Add (s);
-			flags |= Flags.BlockUsed;
 		}
 
-		public bool Used {
-			get { return (flags & Flags.BlockUsed) != 0; }
-		}
-
-		public void Use ()
+		public LabeledStatement LookupLabel (string name)
 		{
-			flags |= Flags.BlockUsed;
+			return ParametersBlock.GetLabel (name, this);
 		}
 
-		public bool HasRet {
-			get { return (flags & Flags.HasRet) != 0; }
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (rc.IsUnreachable)
+				return rc;
+
+			MarkReachableScope (rc);
+
+			foreach (var s in statements) {
+				rc = s.MarkReachable (rc);
+				if (rc.IsUnreachable) {
+					if ((flags & Flags.ReachableEnd) != 0)
+						return new Reachability ();
+
+					return rc;
+				}
+			}
+
+			flags |= Flags.ReachableEnd;
+
+			return rc;
 		}
 
-		public int AssignableSlots {
-			get {
-// TODO: Re-enable			
-//				if ((flags & Flags.VariablesInitialized) == 0)
-//					throw new Exception ("Variables have not been initialized yet");
-				return assignable_slots;
+		public void MarkReachableScope (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			if (scope_initializers != null) {
+				foreach (var si in scope_initializers)
+					si.MarkReachable (rc);
 			}
 		}
 
-		public ArrayList AnonymousChildren {
-			get { return anonymous_children; }
-		}
-
-		public void AddAnonymousChild (ToplevelBlock b)
+		public override bool Resolve (BlockContext bc)
 		{
-			if (anonymous_children == null)
-				anonymous_children = new ArrayList ();
+			if ((flags & Flags.Resolved) != 0)
+				return true;
 
-			anonymous_children.Add (b);
-		}
-
-		void DoResolveConstants (BlockContext ec)
-		{
-			if (constants == null)
-				return;
-
-			if (variables == null)
-				throw new InternalErrorException ("cannot happen");
-
-			foreach (DictionaryEntry de in variables) {
-				string name = (string) de.Key;
-				LocalInfo vi = (LocalInfo) de.Value;
-				Type variable_type = vi.VariableType;
-
-				if (variable_type == null) {
-					if (vi.Type is VarExpr)
-						ec.Report.Error (822, vi.Type.Location, "An implicitly typed local variable cannot be a constant");
-
-					continue;
-				}
-
-				Expression cv = (Expression) constants [name];
-				if (cv == null)
-					continue;
-
-				// Don't let 'const int Foo = Foo;' succeed.
-				// Removing the name from 'constants' ensures that we get a LocalVariableReference below,
-				// which in turn causes the 'must be constant' error to be triggered.
-				constants.Remove (name);
-
-				if (!Const.IsConstantTypeValid (variable_type)) {
-					Const.Error_InvalidConstantType (variable_type, loc, ec.Report);
-					continue;
-				}
-
-				ec.CurrentBlock = this;
-				Expression e;
-				using (ec.With (ResolveContext.Options.ConstantCheckState, (flags & Flags.Unchecked) == 0)) {
-					e = cv.Resolve (ec);
-				}
-				if (e == null)
-					continue;
-
-				Constant ce = e as Constant;
-				if (ce == null) {
-					Const.Error_ExpressionMustBeConstant (vi.Location, name, ec.Report);
-					continue;
-				}
-
-				e = ce.ConvertImplicitly (variable_type);
-				if (e == null) {
-					if (TypeManager.IsReferenceType (variable_type))
-						Const.Error_ConstantCanBeInitializedWithNullOnly (variable_type, vi.Location, vi.Name, ec.Report);
-					else
-						ce.Error_ValueCannotBeConverted (ec, vi.Location, variable_type, false);
-					continue;
-				}
-
-				constants.Add (name, e);
-				vi.IsConstant = true;
-			}
-		}
-
-		protected void ResolveMeta (BlockContext ec, int offset)
-		{
-			Report.Debug (64, "BLOCK RESOLVE META", this, Parent);
-
-			// If some parent block was unsafe, we remain unsafe even if this block
-			// isn't explicitly marked as such.
-			using (ec.With (ResolveContext.Options.UnsafeScope, ec.IsUnsafe | Unsafe)) {
-				flags |= Flags.VariablesInitialized;
-
-				if (variables != null) {
-					foreach (LocalInfo li in variables.Values) {
-						if (!li.Resolve (ec))
-							continue;
-						li.VariableInfo = new VariableInfo (li, offset);
-						offset += li.VariableInfo.Length;
-					}
-				}
-				assignable_slots = offset;
-
-				DoResolveConstants (ec);
-
-				if (children == null)
-					return;
-				foreach (Block b in children)
-					b.ResolveMeta (ec, offset);
-			}
-		}
-
-		//
-		// Emits the local variable declarations for a block
-		//
-		public virtual void EmitMeta (EmitContext ec)
-		{
-			if (variables != null){
-				foreach (LocalInfo vi in variables.Values)
-					vi.ResolveVariable (ec);
-			}
-
-			if (temporary_variables != null) {
-				for (int i = 0; i < temporary_variables.Count; i++)
-					((LocalInfo)temporary_variables[i]).ResolveVariable(ec);
-			}
-
-			if (children != null) {
-				for (int i = 0; i < children.Count; i++)
-					((Block)children[i]).EmitMeta(ec);
-			}
-		}
-
-		void UsageWarning (BlockContext ec)
-		{
-			if (variables == null || ec.Report.WarningLevel < 3)
-				return;
-
-			foreach (DictionaryEntry de in variables) {
-				LocalInfo vi = (LocalInfo) de.Value;
-
-				if (!vi.Used) {
-					string name = (string) de.Key;
-
-					// vi.VariableInfo can be null for 'catch' variables
-					if (vi.VariableInfo != null && vi.VariableInfo.IsEverAssigned)
-						ec.Report.Warning (219, 3, vi.Location, "The variable `{0}' is assigned but its value is never used", name);
-					else
-						ec.Report.Warning (168, 3, vi.Location, "The variable `{0}' is declared but never used", name);
-				}
-			}
-		}
-
-		static void CheckPossibleMistakenEmptyStatement (BlockContext ec, Statement s)
-		{
-			Statement body;
-
-			// Some statements are wrapped by a Block. Since
-			// others' internal could be changed, here I treat
-			// them as possibly wrapped by Block equally.
-			Block b = s as Block;
-			if (b != null && b.statements.Count == 1)
-				s = (Statement) b.statements [0];
-
-			if (s is Lock)
-				body = ((Lock) s).Statement;
-			else if (s is For)
-				body = ((For) s).Statement;
-			else if (s is Foreach)
-				body = ((Foreach) s).Statement;
-			else if (s is While)
-				body = ((While) s).Statement;
-			else if (s is Fixed)
-				body = ((Fixed) s).Statement;
-			else if (s is Using)
-				body = ((Using) s).EmbeddedStatement;
-			else if (s is UsingTemporary)
-				body = ((UsingTemporary) s).Statement;
-			else
-				return;
-
-			if (body == null || body is EmptyStatement)
-				ec.Report.Warning (642, 3, s.loc, "Possible mistaken empty statement");
-		}
-
-		public override bool Resolve (BlockContext ec)
-		{
-			Block prev_block = ec.CurrentBlock;
-			bool ok = true;
-
-			int errors = ec.Report.Errors;
-
-			ec.CurrentBlock = this;
-			ec.StartFlowBranching (this);
-
-			Report.Debug (4, "RESOLVE BLOCK", StartLocation, ec.CurrentBranching);
+			Block prev_block = bc.CurrentBlock;
+			bc.CurrentBlock = this;
 
 			//
 			// Compiler generated scope statements
 			//
 			if (scope_initializers != null) {
-				foreach (Statement s in scope_initializers)
-					s.Resolve (ec);
+				for (resolving_init_idx = 0; resolving_init_idx < scope_initializers.Count; ++resolving_init_idx) {
+					scope_initializers[resolving_init_idx.Value].Resolve (bc);
+				}
+
+				resolving_init_idx = null;
 			}
 
-			//
-			// This flag is used to notate nested statements as unreachable from the beginning of this block.
-			// For the purposes of this resolution, it doesn't matter that the whole block is unreachable 
-			// from the beginning of the function.  The outer Resolve() that detected the unreachability is
-			// responsible for handling the situation.
-			//
+			bool ok = true;
 			int statement_count = statements.Count;
 			for (int ix = 0; ix < statement_count; ix++){
-				Statement s = (Statement) statements [ix];
-				if (s == null)
-					continue; 
-				
-				// Check possible empty statement (CS0642)
-				if (ix + 1 < statement_count && ec.Report.WarningLevel >= 3 &&
-					statements [ix + 1] is ExplicitBlock)
-					CheckPossibleMistakenEmptyStatement (ec, s);
+				Statement s = statements [ix];
 
-				//
-				// Warn if we detect unreachable code.
-				//
-				if (unreachable) {
-					if (s is EmptyStatement)
-						continue;
-
-					if (!unreachable_shown && !(s is LabeledStatement)) {
-						ec.Report.Warning (162, 2, s.loc, "Unreachable code detected");
-						unreachable_shown = true;
-					}
-
-					Block c_block = s as Block;
-					if (c_block != null)
-						c_block.unreachable = c_block.unreachable_shown = true;
-				}
-
-				//
-				// Note that we're not using ResolveUnreachable() for unreachable
-				// statements here.  ResolveUnreachable() creates a temporary
-				// flow branching and kills it afterwards.  This leads to problems
-				// if you have two unreachable statements where the first one
-				// assigns a variable and the second one tries to access it.
-				//
-
-				if (!s.Resolve (ec)) {
+				if (!s.Resolve (bc)) {
 					ok = false;
-					if (ec.IsInProbingMode)
-						break;
+					if (!bc.IsInProbingMode)
+						statements [ix] = new EmptyStatement (s.loc);
 
-					statements [ix] = EmptyStatement.Value;
 					continue;
 				}
-
-				if (unreachable && !(s is LabeledStatement) && !(s is Block))
-					statements [ix] = EmptyStatement.Value;
-
-				unreachable = ec.CurrentBranching.CurrentUsageVector.IsUnreachable;
-				if (unreachable && s is LabeledStatement)
-					throw new InternalErrorException ("should not happen");
 			}
 
-			Report.Debug (4, "RESOLVE BLOCK DONE", StartLocation,
-				      ec.CurrentBranching, statement_count);
+			bc.CurrentBlock = prev_block;
 
-			while (ec.CurrentBranching is FlowBranchingLabeled)
-				ec.EndFlowBranching ();
-
-			bool flow_unreachable = ec.EndFlowBranching ();
-
-			ec.CurrentBlock = prev_block;
-
-			if (flow_unreachable)
-				flags |= Flags.HasRet;
-
-			// If we're a non-static `struct' constructor which doesn't have an
-			// initializer, then we must initialize all of the struct's fields.
-			if (this == Toplevel && !Toplevel.IsThisAssigned (ec) && !flow_unreachable)
-				ok = false;
-
-			if ((labels != null) && (ec.Report.WarningLevel >= 2)) {
-				foreach (LabeledStatement label in labels.Values)
-					if (!label.HasBeenReferenced)
-						ec.Report.Warning (164, 2, label.loc, "This label has not been referenced");
-			}
-
-			if (ok && errors == ec.Report.Errors)
-				UsageWarning (ec);
-
+			flags |= Flags.Resolved;
 			return ok;
 		}
 
-		public override bool ResolveUnreachable (BlockContext ec, bool warn)
-		{
-			unreachable_shown = true;
-			unreachable = true;
-
-			if (warn)
-				ec.Report.Warning (162, 2, loc, "Unreachable code detected");
-
-			ec.StartFlowBranching (FlowBranching.BranchingType.Block, loc);
-			bool ok = Resolve (ec);
-			ec.KillFlowBranching ();
-
-			return ok;
-		}
-		
 		protected override void DoEmit (EmitContext ec)
 		{
 			for (int ix = 0; ix < statements.Count; ix++){
-				Statement s = (Statement) statements [ix];
-				s.Emit (ec);
+				statements [ix].Emit (ec);
 			}
 		}
 
@@ -2236,106 +2944,160 @@ namespace Mono.CSharp {
 			if (scope_initializers != null)
 				EmitScopeInitializers (ec);
 
-			ec.Mark (StartLocation);
 			DoEmit (ec);
-
-			if (SymbolWriter.HasSymbolWriter)
-				EmitSymbolInfo (ec);
 		}
 
 		protected void EmitScopeInitializers (EmitContext ec)
 		{
-			SymbolWriter.OpenCompilerGeneratedBlock (ec.ig);
-
-			using (ec.With (EmitContext.Options.OmitDebugInfo, true)) {
-				foreach (Statement s in scope_initializers)
-					s.Emit (ec);
-			}
-
-			SymbolWriter.CloseCompilerGeneratedBlock (ec.ig);
+			foreach (Statement s in scope_initializers)
+				s.Emit (ec);
 		}
 
-		protected virtual void EmitSymbolInfo (EmitContext ec)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			if (variables != null) {
-				foreach (LocalInfo vi in variables.Values) {
-					vi.EmitSymbolInfo (ec);
-				}
-			}
-		}
-
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-		{
-			MutateVariables (storey);
-
 			if (scope_initializers != null) {
-				foreach (Statement s in scope_initializers)
-					s.MutateHoistedGenericType (storey);
+				foreach (var si in scope_initializers)
+					si.FlowAnalysis (fc);
 			}
 
-			foreach (Statement s in statements)
-				s.MutateHoistedGenericType (storey);
+			return DoFlowAnalysis (fc, 0);	
 		}
 
-		void MutateVariables (AnonymousMethodStorey storey)
+		bool DoFlowAnalysis (FlowAnalysisContext fc, int startIndex)
 		{
-			if (variables != null) {
-				foreach (LocalInfo vi in variables.Values) {
-					vi.VariableType = storey.MutateType (vi.VariableType);
+			bool end_unreachable = !reachable;
+			for (; startIndex < statements.Count; ++startIndex) {
+				var s = statements[startIndex];
+
+				end_unreachable = s.FlowAnalysis (fc);
+				if (s.IsUnreachable) {
+					statements [startIndex] = RewriteUnreachableStatement (s);
+					continue;
+				}
+
+				//
+				// Statement end reachability is needed mostly due to goto support. Consider
+				//
+				// if (cond) {
+				//    goto X;
+				// } else {
+				//    goto Y;
+				// }
+				// X:
+				//
+				// X label is reachable only via goto not as another statement after if. We need
+				// this for flow-analysis only to carry variable info correctly.
+				//
+				if (end_unreachable) {
+					for (++startIndex; startIndex < statements.Count; ++startIndex) {
+						s = statements[startIndex];
+						if (s is SwitchLabel) {
+							s.FlowAnalysis (fc);
+							break;
+						}
+
+						if (s.IsUnreachable) {
+							s.FlowAnalysis (fc);
+							statements [startIndex] = RewriteUnreachableStatement (s);
+						}
+					}
 				}
 			}
 
-			if (temporary_variables != null) {
-				foreach (LocalInfo vi in temporary_variables)
-					vi.VariableType = storey.MutateType (vi.VariableType);
-			}
+			//
+			// The condition should be true unless there is forward jumping goto
+			// 
+			// if (this is ExplicitBlock && end_unreachable != Explicit.HasReachableClosingBrace)
+			//	Debug.Fail ();
+
+			return !Explicit.HasReachableClosingBrace;
 		}
 
+		static Statement RewriteUnreachableStatement (Statement s)
+		{
+			// LAMESPEC: It's not clear whether declararion statement should be part of reachability
+			// analysis. Even csc report unreachable warning for it but it's actually used hence
+			// we try to emulate this behaviour
+			//
+			// Consider:
+			// 	goto L;
+			//	int v;
+			// L:
+			//	v = 1;
+
+			if (s is BlockVariable)
+				return s;
+
+			return new EmptyStatement (s.loc);
+		}
+
+		public void ScanGotoJump (Statement label)
+		{
+			int i;
+			for (i = 0; i < statements.Count; ++i) {
+				if (statements[i] == label)
+					break;
+			}
+
+			var rc = new Reachability ();
+			for (++i; i < statements.Count; ++i) {
+				var s = statements[i];
+				rc = s.MarkReachable (rc);
+				if (rc.IsUnreachable)
+					return;
+			}
+
+			flags |= Flags.ReachableEnd;
+		}
+
+		public void ScanGotoJump (Statement label, FlowAnalysisContext fc)
+		{
+			int i;
+			for (i = 0; i < statements.Count; ++i) {
+				if (statements[i] == label)
+					break;
+			}
+
+			DoFlowAnalysis (fc, ++i);
+		}
+
+#if DEBUG
 		public override string ToString ()
 		{
-			return String.Format ("{0} ({1}:{2})", GetType (),ID, StartLocation);
+			return String.Format ("{0}: ID={1} Clone={2} Location={3}", GetType (), ID, clone_id != 0, StartLocation);
 		}
+#endif
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			Block target = (Block) t;
+#if DEBUG
+			target.clone_id = ++clone_id_counter;
+#endif
 
 			clonectx.AddBlockMap (this, target);
+			if (original != this)
+				clonectx.AddBlockMap (original, target);
 
-			//target.Toplevel = (ToplevelBlock) clonectx.LookupBlock (Toplevel);
-			target.Explicit = (ExplicitBlock) clonectx.LookupBlock (Explicit);
+			target.ParametersBlock = (ParametersBlock) (ParametersBlock == this ? target : clonectx.RemapBlockCopy (ParametersBlock));
+			target.Explicit = (ExplicitBlock) (Explicit == this ? target : clonectx.LookupBlock (Explicit));
+
 			if (Parent != null)
 				target.Parent = clonectx.RemapBlockCopy (Parent);
 
-			if (variables != null){
-				target.variables = new Hashtable ();
-
-				foreach (DictionaryEntry de in variables){
-					LocalInfo newlocal = ((LocalInfo) de.Value).Clone (clonectx);
-					target.variables [de.Key] = newlocal;
-					clonectx.AddVariableMap ((LocalInfo) de.Value, newlocal);
-				}
-			}
-
-			target.statements = new ArrayList (statements.Count);
+			target.statements = new List<Statement> (statements.Count);
 			foreach (Statement s in statements)
 				target.statements.Add (s.Clone (clonectx));
+		}
 
-			if (target.children != null){
-				target.children = new ArrayList (children.Count);
-				foreach (Block b in children){
-					target.children.Add (clonectx.LookupBlock (b));
-				}
-			}
-
-			//
-			// TODO: labels, switch_block, constants (?), anonymous_children
-			//
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
-	public class ExplicitBlock : Block {
-		HybridDictionary known_variables;
+	public class ExplicitBlock : Block
+	{
 		protected AnonymousMethodStorey am_storey;
 
 		public ExplicitBlock (Block parent, Location start, Location end)
@@ -2349,25 +3111,58 @@ namespace Mono.CSharp {
 			this.Explicit = this;
 		}
 
-		// <summary>
-		//   Marks a variable with name @name as being used in this or a child block.
-		//   If a variable name has been used in a child block, it's illegal to
-		//   declare a variable with the same name in the current block.
-		// </summary>
-		internal void AddKnownVariable (string name, IKnownVariable info)
-		{
-			if (known_variables == null)
-				known_variables = new HybridDictionary();
-
-			known_variables [name] = info;
-
-			if (Parent != null)
-				Parent.Explicit.AddKnownVariable (name, info);
-		}
+		#region Properties
 
 		public AnonymousMethodStorey AnonymousMethodStorey {
-			get { return am_storey; }
+			get {
+				return am_storey;
+			}
 		}
+
+		public bool HasAwait {
+			get {
+				return (flags & Flags.AwaitBlock) != 0;
+			}
+		}
+
+		public bool HasCapturedThis {
+			set {
+				flags = value ? flags | Flags.HasCapturedThis : flags & ~Flags.HasCapturedThis;
+			}
+			get {
+				return (flags & Flags.HasCapturedThis) != 0;
+			}
+		}
+
+		//
+		// Used to indicate that the block has reference to parent
+		// block and cannot be made static when defining anonymous method
+		//
+		public bool HasCapturedVariable {
+			set {
+				flags = value ? flags | Flags.HasCapturedVariable : flags & ~Flags.HasCapturedVariable;
+			}
+			get {
+				return (flags & Flags.HasCapturedVariable) != 0;
+			}
+		}
+
+		public bool HasReachableClosingBrace {
+		    get {
+		        return (flags & Flags.ReachableEnd) != 0;
+		    }
+			set {
+				flags = value ? flags | Flags.ReachableEnd : flags & ~Flags.ReachableEnd;
+			}
+		}
+
+		public bool HasYield {
+			get {
+				return (flags & Flags.YieldBlock) != 0;
+			}
+		}
+
+		#endregion
 
 		//
 		// Creates anonymous method storey in current block
@@ -2375,172 +3170,374 @@ namespace Mono.CSharp {
 		public AnonymousMethodStorey CreateAnonymousMethodStorey (ResolveContext ec)
 		{
 			//
-			// When referencing a variable in iterator storey from children anonymous method
+			// Return same story for iterator and async blocks unless we are
+			// in nested anonymous method
 			//
-			if (Toplevel.am_storey is IteratorStorey) {
-				return Toplevel.am_storey;
-			}
-
-			//
-			// An iterator has only 1 storey block
-			//
-			if (ec.CurrentIterator != null)
-			    return ec.CurrentIterator.Storey;
+			if (ec.CurrentAnonymousMethod is StateMachineInitializer && ParametersBlock.Original == ec.CurrentAnonymousMethod.Block.Original)
+				return ec.CurrentAnonymousMethod.Storey;
 
 			if (am_storey == null) {
 				MemberBase mc = ec.MemberContext as MemberBase;
-				GenericMethod gm = mc == null ? null : mc.GenericMethod;
 
 				//
 				// Creates anonymous method storey for this block
 				//
-				am_storey = new AnonymousMethodStorey (this, ec.CurrentTypeDefinition, mc, gm, "AnonStorey");
+				am_storey = new AnonymousMethodStorey (this, ec.CurrentMemberDefinition.Parent.PartialContainer, mc, ec.CurrentTypeParameters, "AnonStorey", MemberKind.Class);
 			}
 
 			return am_storey;
 		}
 
-		public override void Emit (EmitContext ec)
+		public void EmitScopeInitialization (EmitContext ec)
 		{
-			if (am_storey != null)
-				am_storey.EmitStoreyInstantiation (ec);
+			if ((flags & Flags.InitializationEmitted) != 0)
+				return;
 
-			bool emit_debug_info = SymbolWriter.HasSymbolWriter && Parent != null && !(am_storey is IteratorStorey);
-			if (emit_debug_info)
-				ec.BeginScope ();
+			if (am_storey != null) {
+				DefineStoreyContainer (ec, am_storey);
+				am_storey.EmitStoreyInstantiation (ec, this);
+			}
 
-			base.Emit (ec);
+			if (scope_initializers != null)
+				EmitScopeInitializers (ec);
 
-			if (emit_debug_info)
-				ec.EndScope ();
+			flags |= Flags.InitializationEmitted;
 		}
 
-		public override void EmitMeta (EmitContext ec)
+		public override void Emit (EmitContext ec)
 		{
+			EmitScopeInitialization (ec);
+
+			if (ec.EmitAccurateDebugInfo && !IsCompilerGenerated && ec.Mark (StartLocation)) {
+				ec.Emit (OpCodes.Nop);
+			}
+
+			if (Parent != null)
+				ec.BeginScope ();
+
+			DoEmit (ec);
+
+			if (Parent != null)
+				ec.EndScope ();
+
+			if (ec.EmitAccurateDebugInfo && HasReachableClosingBrace && !(this is ParametersBlock) &&
+				!IsCompilerGenerated && ec.Mark (EndLocation)) {
+				ec.Emit (OpCodes.Nop);
+			}
+		}
+
+		protected void DefineStoreyContainer (EmitContext ec, AnonymousMethodStorey storey)
+		{
+			if (ec.CurrentAnonymousMethod != null && ec.CurrentAnonymousMethod.Storey != null) {
+				storey.SetNestedStoryParent (ec.CurrentAnonymousMethod.Storey);
+				storey.Mutator = ec.CurrentAnonymousMethod.Storey.Mutator;
+			}
+
 			//
 			// Creates anonymous method storey
 			//
-			if (am_storey != null) {
-				if (ec.CurrentAnonymousMethod != null && ec.CurrentAnonymousMethod.Storey != null) {
-					//
-					// Creates parent storey reference when hoisted this is accessible
-					//
-					if (am_storey.OriginalSourceBlock.Explicit.HasCapturedThis) {
-						ExplicitBlock parent = Toplevel.Parent.Explicit;
+			storey.CreateContainer ();
+			storey.DefineContainer ();
 
-						//
-						// Hoisted this exists in top-level parent storey only
-						//
-						while (parent.am_storey == null || parent.am_storey.Parent is AnonymousMethodStorey)
-							parent = parent.Parent.Explicit;
+			if (Original.Explicit.HasCapturedThis && Original.ParametersBlock.TopBlock.ThisReferencesFromChildrenBlock != null) {
 
-						am_storey.AddParentStoreyReference (parent.am_storey);
+				//
+				// Only first storey in path will hold this reference. All children blocks will
+				// reference it indirectly using $ref field
+				//
+				for (Block b = Original.Explicit; b != null; b = b.Parent) {
+					if (b.Parent != null) {
+						var s = b.Parent.Explicit.AnonymousMethodStorey;
+						if (s != null) {
+							storey.HoistedThis = s.HoistedThis;
+							break;
+						}
 					}
 
-					am_storey.ChangeParentStorey (ec.CurrentAnonymousMethod.Storey);
+					if (b.Explicit == b.Explicit.ParametersBlock && b.Explicit.ParametersBlock.StateMachine != null) {
+						if (storey.HoistedThis == null)
+							storey.HoistedThis = b.Explicit.ParametersBlock.StateMachine.HoistedThis;
+
+						if (storey.HoistedThis != null)
+							break;
+					}
 				}
+				
+				//
+				// We are the first storey on path and 'this' has to be hoisted
+				//
+				if (storey.HoistedThis == null) {
+					foreach (ExplicitBlock ref_block in Original.ParametersBlock.TopBlock.ThisReferencesFromChildrenBlock) {
+						//
+						// ThisReferencesFromChildrenBlock holds all reference even if they
+						// are not on this path. It saves some memory otherwise it'd have to
+						// be in every explicit block. We run this check to see if the reference
+						// is valid for this storey
+						//
+						Block block_on_path = ref_block;
+						for (; block_on_path != null && block_on_path != Original; block_on_path = block_on_path.Parent);
 
-				am_storey.DefineType ();
-				am_storey.ResolveType ();
-				am_storey.Define ();
-				am_storey.Parent.PartialContainer.AddCompilerGeneratedClass (am_storey);
+						if (block_on_path == null)
+							continue;
 
-				ArrayList ref_blocks = am_storey.ReferencesFromChildrenBlock;
-				if (ref_blocks != null) {
-					foreach (ExplicitBlock ref_block in ref_blocks) {
-						for (ExplicitBlock b = ref_block.Explicit; b != this; b = b.Parent.Explicit) {
-							if (b.am_storey != null) {
-								b.am_storey.AddParentStoreyReference (am_storey);
+						if (storey.HoistedThis == null) {
+							storey.AddCapturedThisField (ec, null);
+						}
 
+						for (ExplicitBlock b = ref_block; b.AnonymousMethodStorey != storey; b = b.Parent.Explicit) {
+							ParametersBlock pb;
+							AnonymousMethodStorey b_storey = b.AnonymousMethodStorey;
+
+							if (b_storey != null) {
+								//
+								// Don't add storey cross reference for `this' when the storey ends up not
+								// beeing attached to any parent
+								//
+								if (b.ParametersBlock.StateMachine == null) {
+									AnonymousMethodStorey s = null;
+									for (Block ab = b.AnonymousMethodStorey.OriginalSourceBlock.Parent; ab != null; ab = ab.Parent) {
+										s = ab.Explicit.AnonymousMethodStorey;
+										if (s != null)
+											break;
+									}
+
+									// Needs to be in sync with AnonymousMethodBody::DoCreateMethodHost
+									if (s == null) {
+										var parent = storey == null || storey.Kind == MemberKind.Struct ? null : storey;
+										b.AnonymousMethodStorey.AddCapturedThisField (ec, parent);
+										break;
+									}
+
+								}
+
+								//
 								// Stop propagation inside same top block
-								if (b.Toplevel == Toplevel)
+								//
+								if (b.ParametersBlock == ParametersBlock.Original) {
+									b_storey.AddParentStoreyReference (ec, storey);
+//									b_storey.HoistedThis = storey.HoistedThis;
+									break;
+								}
+
+								b = pb = b.ParametersBlock;
+							} else {
+								pb = b as ParametersBlock;
+							}
+
+							if (pb != null && pb.StateMachine != null) {
+								if (pb.StateMachine == storey)
 									break;
 
-								b = b.Toplevel;
-						    }
-							b.HasCapturedVariable = true;
+								//
+								// If we are state machine with no parent. We can hook into parent without additional
+ 								// reference and capture this directly
+								//
+								ExplicitBlock parent_storey_block = pb;
+								while (parent_storey_block.Parent != null) {
+									parent_storey_block = parent_storey_block.Parent.Explicit;
+									if (parent_storey_block.AnonymousMethodStorey != null) {
+										break;
+									}
+								}
+
+								if (parent_storey_block.AnonymousMethodStorey == null) {
+									pb.StateMachine.AddCapturedThisField (ec, null);
+									b.HasCapturedThis = true;
+									continue;
+								}
+
+								pb.StateMachine.AddParentStoreyReference (ec, storey);
+							}
+
+							//
+							// Add parent storey reference only when this is not captured directly
+							//
+							if (b_storey != null) {
+								b_storey.AddParentStoreyReference (ec, storey);
+								b_storey.HoistedThis = storey.HoistedThis;
+							}
 						}
 					}
 				}
 			}
 
-			base.EmitMeta (ec);
+			var ref_blocks = storey.ReferencesFromChildrenBlock;
+			if (ref_blocks != null) {
+				foreach (ExplicitBlock ref_block in ref_blocks) {
+					for (ExplicitBlock b = ref_block; b.AnonymousMethodStorey != storey; b = b.Parent.Explicit) {
+						if (b.AnonymousMethodStorey != null) {
+							b.AnonymousMethodStorey.AddParentStoreyReference (ec, storey);
+
+							//
+							// Stop propagation inside same top block
+							//
+							if (b.ParametersBlock == ParametersBlock.Original)
+								break;
+
+							b = b.ParametersBlock;
+						}
+
+						var pb = b as ParametersBlock;
+						if (pb != null && pb.StateMachine != null) {
+							if (pb.StateMachine == storey)
+								break;
+
+							pb.StateMachine.AddParentStoreyReference (ec, storey);
+						}
+
+						b.HasCapturedVariable = true;
+					}
+				}
+			}
+
+			storey.Define ();
+			storey.PrepareEmit ();
+			storey.Parent.PartialContainer.AddCompilerGeneratedClass (storey);
 		}
 
-		internal IKnownVariable GetKnownVariable (string name)
+		public void RegisterAsyncAwait ()
 		{
-			return known_variables == null ? null : (IKnownVariable) known_variables [name];
+			var block = this;
+			while ((block.flags & Flags.AwaitBlock) == 0) {
+				block.flags |= Flags.AwaitBlock;
+
+				if (block is ParametersBlock)
+					return;
+
+				block = block.Parent.Explicit;
+			}
 		}
 
-		public bool HasCapturedThis
+		public void RegisterIteratorYield ()
 		{
-			set { flags = value ? flags | Flags.HasCapturedThis : flags & ~Flags.HasCapturedThis; }
-			get { return (flags & Flags.HasCapturedThis) != 0; }
+			ParametersBlock.TopBlock.IsIterator = true;
+
+			var block = this;
+			while ((block.flags & Flags.YieldBlock) == 0) {
+				block.flags |= Flags.YieldBlock;
+
+				if (block.Parent == null)
+					return;
+
+				block = block.Parent.Explicit;
+			}
 		}
 
-		public bool HasCapturedVariable
+		public void SetCatchBlock ()
 		{
-			set { flags = value ? flags | Flags.HasCapturedVariable : flags & ~Flags.HasCapturedVariable; }
-			get { return (flags & Flags.HasCapturedVariable) != 0; }
+			flags |= Flags.CatchBlock;
 		}
 
-		protected override void CloneTo (CloneContext clonectx, Statement t)
+		public void SetFinallyBlock ()
 		{
-			ExplicitBlock target = (ExplicitBlock) t;
-			target.known_variables = null;
-			base.CloneTo (clonectx, t);
-		}
-	}
-
-	public class ToplevelParameterInfo : IKnownVariable {
-		public readonly ToplevelBlock Block;
-		public readonly int Index;
-		public VariableInfo VariableInfo;
-
-		Block IKnownVariable.Block {
-			get { return Block; }
-		}
-		public Parameter Parameter {
-			get { return Block.Parameters [Index]; }
+			flags |= Flags.FinallyBlock;
 		}
 
-		public Type ParameterType {
-			get { return Block.Parameters.Types [Index]; }
-		}
-
-		public Location Location {
-			get { return Parameter.Location; }
-		}
-
-		public ToplevelParameterInfo (ToplevelBlock block, int idx)
+		public void WrapIntoDestructor (TryFinally tf, ExplicitBlock tryBlock)
 		{
-			this.Block = block;
-			this.Index = idx;
+			tryBlock.statements = statements;
+			statements = new List<Statement> (1);
+			statements.Add (tf);
 		}
 	}
 
 	//
-	// A toplevel block contains extra information, the split is done
-	// only to separate information that would otherwise bloat the more
-	// lightweight Block.
-	//
-	// In particular, this was introduced when the support for Anonymous
-	// Methods was implemented. 
+	// ParametersBlock was introduced to support anonymous methods
+	// and lambda expressions
 	// 
-	public class ToplevelBlock : ExplicitBlock
+	public class ParametersBlock : ExplicitBlock
 	{
+		public class ParameterInfo : INamedBlockVariable
+		{
+			readonly ParametersBlock block;
+			readonly int index;
+			public VariableInfo VariableInfo;
+			bool is_locked;
+
+			public ParameterInfo (ParametersBlock block, int index)
+			{
+				this.block = block;
+				this.index = index;
+			}
+
+			#region Properties
+
+			public ParametersBlock Block {
+				get {
+					return block;
+				}
+			}
+
+			Block INamedBlockVariable.Block {
+				get {
+					return block;
+				}
+			}
+
+			public bool IsDeclared {
+				get {
+					return true;
+				}
+			}
+
+			public bool IsParameter {
+				get {
+					return true;
+				}
+			}
+
+			public bool IsLocked {
+				get {
+					return is_locked;
+				}
+				set {
+					is_locked = value;
+				}
+			}
+
+			public Location Location {
+				get {
+					return Parameter.Location;
+				}
+			}
+
+			public Parameter Parameter {
+				get {
+					return block.Parameters [index];
+				}
+			}
+
+			public TypeSpec ParameterType {
+				get {
+					return Parameter.Type;
+				}
+			}
+
+			#endregion
+
+			public Expression CreateReferenceExpression (ResolveContext rc, Location loc)
+			{
+				return new ParameterReference (this, loc);
+			}
+		}
+
 		// 
-		// Block is converted to an expression
+		// Block is converted into an expression
 		//
 		sealed class BlockScopeExpression : Expression
 		{
 			Expression child;
-			readonly ToplevelBlock block;
+			readonly ParametersBlock block;
 
-			public BlockScopeExpression (Expression child, ToplevelBlock block)
+			public BlockScopeExpression (Expression child, ParametersBlock block)
 			{
 				this.child = child;
 				this.block = block;
+			}
+
+			public override bool ContainsEmitWithAwait ()
+			{
+				return child.ContainsEmitWithAwait ();
 			}
 
 			public override Expression CreateExpressionTree (ResolveContext ec)
@@ -2548,11 +3545,11 @@ namespace Mono.CSharp {
 				throw new NotSupportedException ();
 			}
 
-			public override Expression DoResolve (ResolveContext ec)
+			protected override Expression DoResolve (ResolveContext ec)
 			{
 				if (child == null)
 					return null;
-				
+
 				child = child.Resolve (ec);
 				if (child == null)
 					return null;
@@ -2564,32 +3561,85 @@ namespace Mono.CSharp {
 
 			public override void Emit (EmitContext ec)
 			{
-				block.EmitMeta (ec);
 				block.EmitScopeInitializers (ec);
 				child.Emit (ec);
 			}
+		}
 
-			public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-			{
-				type = storey.MutateType (type);
-				child.MutateHoistedGenericType (storey);
-				block.MutateHoistedGenericType (storey);
+		protected ParametersCompiled parameters;
+		protected ParameterInfo[] parameter_info;
+		protected bool resolved;
+		protected ToplevelBlock top_block;
+		protected StateMachine state_machine;
+		protected Dictionary<string, object> labels;
+
+		public ParametersBlock (Block parent, ParametersCompiled parameters, Location start, Flags flags = 0)
+			: base (parent, 0, start, start)
+		{
+			if (parameters == null)
+				throw new ArgumentNullException ("parameters");
+
+			this.parameters = parameters;
+			ParametersBlock = this;
+
+			this.flags |= flags | (parent.ParametersBlock.flags & (Flags.YieldBlock | Flags.AwaitBlock));
+
+			this.top_block = parent.ParametersBlock.top_block;
+			ProcessParameters ();
+		}
+
+		protected ParametersBlock (ParametersCompiled parameters, Location start)
+			: base (null, 0, start, start)
+		{
+			if (parameters == null)
+				throw new ArgumentNullException ("parameters");
+
+			this.parameters = parameters;
+			ParametersBlock = this;
+		}
+
+		//
+		// It's supposed to be used by method body implementation of anonymous methods
+		//
+		protected ParametersBlock (ParametersBlock source, ParametersCompiled parameters)
+			: base (null, 0, source.StartLocation, source.EndLocation)
+		{
+			this.parameters = parameters;
+			this.statements = source.statements;
+			this.scope_initializers = source.scope_initializers;
+
+			this.resolved = true;
+			this.reachable = source.reachable;
+			this.am_storey = source.am_storey;
+			this.state_machine = source.state_machine;
+			this.flags = source.flags & Flags.ReachableEnd;
+
+			ParametersBlock = this;
+
+			//
+			// Overwrite original for comparison purposes when linking cross references
+			// between anonymous methods
+			//
+			Original = source.Original;
+		}
+
+		#region Properties
+
+		public bool IsAsync {
+			get {
+				return (flags & Flags.HasAsyncModifier) != 0;
+			}
+			set {
+				flags = value ? flags | Flags.HasAsyncModifier : flags & ~Flags.HasAsyncModifier;
 			}
 		}
 
-		GenericMethod generic;
-		protected ParametersCompiled parameters;
-		ToplevelParameterInfo[] parameter_info;
-		LocalInfo this_variable;
-		bool resolved;
-		bool unreachable;
-		CompilerContext compiler;
-
-		public HoistedVariable HoistedThisVariable;
-
-		public bool Resolved {
+		//
+		// Block has been converted to expression tree
+		//
+		public bool IsExpressionTree {
 			get {
-				return resolved;
+				return (flags & Flags.IsExpressionTree) != 0;
 			}
 		}
 
@@ -2597,130 +3647,106 @@ namespace Mono.CSharp {
 		// The parameters for the block.
 		//
 		public ParametersCompiled Parameters {
-			get { return parameters; }
+			get {
+				return parameters;
+			}
 		}
 
-		public Report Report {
-			get { return compiler.Report; }
+		public StateMachine StateMachine {
+			get {
+				return state_machine;
+			}
 		}
 
-		public GenericMethod GenericMethod {
-			get { return generic; }
+		public ToplevelBlock TopBlock {
+			get {
+				return top_block;
+			}
+			set {
+				top_block = value;
+			}
 		}
 
-		public ToplevelBlock Container {
-			get { return Parent == null ? null : Parent.Toplevel; }
+		public bool Resolved {
+			get {
+				return (flags & Flags.Resolved) != 0;
+			}
 		}
 
-		public ToplevelBlock (CompilerContext ctx, Block parent, ParametersCompiled parameters, Location start) :
-			this (ctx, parent, (Flags) 0, parameters, start)
+		public int TemporaryLocalsCount { get; set; }
+
+		#endregion
+
+		//
+		// Checks whether all `out' parameters have been assigned.
+		//
+		public void CheckControlExit (FlowAnalysisContext fc)
 		{
+			CheckControlExit (fc, fc.DefiniteAssignment);
 		}
 
-		public ToplevelBlock (CompilerContext ctx, Block parent, ParametersCompiled parameters, GenericMethod generic, Location start) :
-			this (ctx, parent, parameters, start)
+		public virtual void CheckControlExit (FlowAnalysisContext fc, DefiniteAssignmentBitSet dat)
 		{
-			this.generic = generic;
-		}
+			if (parameter_info == null)
+				return;
 
-		public ToplevelBlock (CompilerContext ctx, ParametersCompiled parameters, Location start) :
-			this (ctx, null, (Flags) 0, parameters, start)
-		{
-		}
+			foreach (var p in parameter_info) {
+				if (p.VariableInfo == null)
+					continue;
 
-		ToplevelBlock (CompilerContext ctx, Flags flags, ParametersCompiled parameters, Location start) :
-			this (ctx, null, flags, parameters, start)
-		{
-		}
+				if (p.VariableInfo.IsAssigned (dat))
+					continue;
 
-		// We use 'Parent' to hook up to the containing block, but don't want to register the current block as a child.
-		// So, we use a two-stage setup -- first pass a null parent to the base constructor, and then override 'Parent'.
-		public ToplevelBlock (CompilerContext ctx, Block parent, Flags flags, ParametersCompiled parameters, Location start) :
-			base (null, flags, start, Location.Null)
-		{
-			this.compiler = ctx;
-			this.Toplevel = this;
-
-			this.parameters = parameters;
-			this.Parent = parent;
-			if (parent != null)
-				parent.AddAnonymousChild (this);
-
-			if (!this.parameters.IsEmpty)
-				ProcessParameters ();
-		}
-
-		public ToplevelBlock (CompilerContext ctx, Location loc)
-			: this (ctx, null, (Flags) 0, ParametersCompiled.EmptyReadOnlyParameters, loc)
-		{
+				fc.Report.Error (177, p.Location,
+					"The out parameter `{0}' must be assigned to before control leaves the current method",
+					p.Parameter.Name);
+			}					
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
-			ToplevelBlock target = (ToplevelBlock) t;
 			base.CloneTo (clonectx, t);
 
-			if (parameters.Count != 0)
-				target.parameter_info = new ToplevelParameterInfo [parameters.Count];
-			for (int i = 0; i < parameters.Count; ++i)
-				target.parameter_info [i] = new ToplevelParameterInfo (target, i);
-		}
+			var target = (ParametersBlock) t;
 
-		public bool CheckError158 (string name, Location loc)
-		{
-			if (AnonymousChildren != null) {
-				foreach (ToplevelBlock child in AnonymousChildren) {
-					if (!child.CheckError158 (name, loc))
-						return false;
+			//
+			// Clone label statements as well as they contain block reference
+			//
+			var pb = this;
+			while (true) {
+				if (pb.labels != null) {
+					target.labels = new Dictionary<string, object> ();
+
+					foreach (var entry in pb.labels) {
+						var list = entry.Value as List<LabeledStatement>;
+
+						if (list != null) {
+							var list_clone = new List<LabeledStatement> ();
+							foreach (var lentry in list) {
+								list_clone.Add (RemapLabeledStatement (lentry, lentry.Block, clonectx.RemapBlockCopy (lentry.Block)));
+							}
+
+							target.labels.Add (entry.Key, list_clone);
+						} else {
+							var labeled = (LabeledStatement) entry.Value;
+							target.labels.Add (entry.Key, RemapLabeledStatement (labeled, labeled.Block, clonectx.RemapBlockCopy (labeled.Block)));
+						}
+					}
+
+					break;
 				}
+
+				if (pb.Parent == null)
+					break;
+
+				pb = pb.Parent.ParametersBlock;
 			}
-
-			for (ToplevelBlock c = Container; c != null; c = c.Container) {
-				if (!c.DoCheckError158 (name, loc))
-					return false;
-			}
-
-			return true;
-		}
-
-		void ProcessParameters ()
-		{
-			int n = parameters.Count;
-			parameter_info = new ToplevelParameterInfo [n];
-			ToplevelBlock top_parent = Parent == null ? null : Parent.Toplevel;
-			for (int i = 0; i < n; ++i) {
-				parameter_info [i] = new ToplevelParameterInfo (this, i);
-
-				Parameter p = parameters [i];
-				if (p == null)
-					continue;
-
-				string name = p.Name;
-				if (CheckParentConflictName (top_parent, name, loc))
-					AddKnownVariable (name, parameter_info [i]);
-			}
-
-			// mark this block as "used" so that we create local declarations in a sub-block
-			// FIXME: This appears to uncover a lot of bugs
-			//this.Use ();
-		}
-
-		bool DoCheckError158 (string name, Location loc)
-		{
-			LabeledStatement s = LookupLabel (name);
-			if (s != null) {
-				Report.SymbolRelatedToPreviousError (s.loc, s.Name);
-				Error_158 (name, loc);
-				return false;
-			}
-
-			return true;
 		}
 
 		public override Expression CreateExpressionTree (ResolveContext ec)
 		{
 			if (statements.Count == 1) {
-				Expression expr = ((Statement) statements[0]).CreateExpressionTree (ec);
+				Expression expr = statements[0].CreateExpressionTree (ec);
 				if (scope_initializers != null)
 					expr = new BlockScopeExpression (expr, this);
 
@@ -2730,53 +3756,570 @@ namespace Mono.CSharp {
 			return base.CreateExpressionTree (ec);
 		}
 
-		//
-		// Reformats this block to be top-level iterator block
-		//
-		public IteratorStorey ChangeToIterator (Iterator iterator, ToplevelBlock source)
+		public override void Emit (EmitContext ec)
 		{
-			IsIterator = true;
+			if (state_machine != null && state_machine.OriginalSourceBlock != this) {
+				DefineStoreyContainer (ec, state_machine);
+				state_machine.EmitStoreyInstantiation (ec, this);
+			}
 
-			// Creates block with original statements
-			AddStatement (new IteratorStatement (iterator, new Block (this, source)));
-
-			source.statements = new ArrayList (1);
-			source.AddStatement (new Return (iterator, iterator.Location));
-			source.IsIterator = false;
-
-			IteratorStorey iterator_storey = new IteratorStorey (iterator);
-			source.am_storey = iterator_storey;
-			return iterator_storey;
+			base.Emit (ec);
 		}
 
-		//
-		// Returns a parameter reference expression for the given name,
-		// or null if there is no such parameter
-		//
-		public Expression GetParameterReference (string name, Location loc)
+		public void EmitEmbedded (EmitContext ec)
 		{
-			for (ToplevelBlock t = this; t != null; t = t.Container) {
-				Expression expr = t.GetParameterReferenceExpression (name, loc);
-				if (expr != null)
-					return expr;
+			if (state_machine != null && state_machine.OriginalSourceBlock != this) {
+				DefineStoreyContainer (ec, state_machine);
+				state_machine.EmitStoreyInstantiation (ec, this);
+			}
+
+			base.Emit (ec);
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			var res = base.DoFlowAnalysis (fc);
+
+			if (HasReachableClosingBrace)
+				CheckControlExit (fc);
+
+			return res;
+		}
+
+		public LabeledStatement GetLabel (string name, Block block)
+		{
+			//
+			// Cloned parameters blocks can have their own cloned version of top-level labels
+			//
+			if (labels == null) {
+				if (Parent != null)
+					return Parent.ParametersBlock.GetLabel (name, block);
+
+				return null;
+			}
+
+			object value;
+			if (!labels.TryGetValue (name, out value)) {
+				return null;
+			}
+
+			var label = value as LabeledStatement;
+			Block b = block;
+			if (label != null) {
+				if (IsLabelVisible (label, b))
+					return label;
+
+			} else {
+				List<LabeledStatement> list = (List<LabeledStatement>) value;
+				for (int i = 0; i < list.Count; ++i) {
+					label = list[i];
+					if (IsLabelVisible (label, b))
+						return label;
+				}
 			}
 
 			return null;
 		}
 
-		protected virtual Expression GetParameterReferenceExpression (string name, Location loc)
+		static bool IsLabelVisible (LabeledStatement label, Block b)
 		{
-			int idx = parameters.GetParameterIndexByName (name);
-			return idx < 0 ?
-				null : new ParameterReference (parameter_info [idx], loc);
+			do {
+				if (label.Block == b)
+					return true;
+				b = b.Parent;
+			} while (b != null);
+
+			return false;
 		}
 
-		// <summary>
-		//   Returns the "this" instance variable of this block.
-		//   See AddThisVariable() for more information.
-		// </summary>
-		public LocalInfo ThisVariable {
-			get { return this_variable; }
+		public ParameterInfo GetParameterInfo (Parameter p)
+		{
+			for (int i = 0; i < parameters.Count; ++i) {
+				if (parameters[i] == p)
+					return parameter_info[i];
+			}
+
+			throw new ArgumentException ("Invalid parameter");
+		}
+
+		public ParameterReference GetParameterReference (int index, Location loc)
+		{
+			return new ParameterReference (parameter_info[index], loc);
+		}
+
+		public Statement PerformClone ()
+		{
+			CloneContext clonectx = new CloneContext ();
+			return Clone (clonectx);
+		}
+
+		protected void ProcessParameters ()
+		{
+			if (parameters.Count == 0)
+				return;
+
+			parameter_info = new ParameterInfo[parameters.Count];
+			for (int i = 0; i < parameter_info.Length; ++i) {
+				var p = parameters.FixedParameters[i];
+				if (p == null)
+					continue;
+
+				// TODO: Should use Parameter only and more block there
+				parameter_info[i] = new ParameterInfo (this, i);
+				if (p.Name != null)
+					AddLocalName (p.Name, parameter_info[i]);
+			}
+		}
+
+		static LabeledStatement RemapLabeledStatement (LabeledStatement stmt, Block src, Block dst)
+		{
+			var src_stmts = src.Statements;
+			for (int i = 0; i < src_stmts.Count; ++i) {
+				if (src_stmts[i] == stmt)
+					return (LabeledStatement) dst.Statements[i];
+			}
+
+			throw new InternalErrorException ("Should never be reached");
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			// TODO: if ((flags & Flags.Resolved) != 0)
+
+			if (resolved)
+				return true;
+
+			resolved = true;
+
+			if (bc.HasSet (ResolveContext.Options.ExpressionTreeConversion))
+				flags |= Flags.IsExpressionTree;
+
+			try {
+				PrepareAssignmentAnalysis (bc);
+
+				if (!base.Resolve (bc))
+					return false;
+
+			} catch (Exception e) {
+				if (e is CompletionResult || bc.Report.IsDisabled || e is FatalException || bc.Report.Printer is NullReportPrinter || bc.Module.Compiler.Settings.BreakOnInternalError)
+					throw;
+
+				if (bc.CurrentBlock != null) {
+					bc.Report.Error (584, bc.CurrentBlock.StartLocation, "Internal compiler error: {0}", e.Message);
+				} else {
+					bc.Report.Error (587, "Internal compiler error: {0}", e.Message);
+				}
+			}
+
+			//
+			// If an asynchronous body of F is either an expression classified as nothing, or a 
+			// statement block where no return statements have expressions, the inferred return type is Task
+			//
+			if (IsAsync) {
+				var am = bc.CurrentAnonymousMethod as AnonymousMethodBody;
+				if (am != null && am.ReturnTypeInference != null && !am.ReturnTypeInference.HasBounds (0)) {
+					am.ReturnTypeInference = null;
+					am.ReturnType = bc.Module.PredefinedTypes.Task.TypeSpec;
+					return true;
+				}
+			}
+
+			return true;
+		}
+
+		void PrepareAssignmentAnalysis (BlockContext bc)
+		{
+			for (int i = 0; i < parameters.Count; ++i) {
+				var par = parameters.FixedParameters[i];
+
+				if ((par.ModFlags & Parameter.Modifier.OUT) == 0)
+					continue;
+
+				parameter_info [i].VariableInfo = VariableInfo.Create (bc, (Parameter) par);
+			}
+		}
+
+		public ToplevelBlock ConvertToIterator (IMethodData method, TypeDefinition host, TypeSpec iterator_type, bool is_enumerable)
+		{
+			var iterator = new Iterator (this, method, host, iterator_type, is_enumerable);
+			var stateMachine = new IteratorStorey (iterator);
+
+			state_machine = stateMachine;
+			iterator.SetStateMachine (stateMachine);
+
+			var tlb = new ToplevelBlock (host.Compiler, Parameters, Location.Null, Flags.CompilerGenerated);
+			tlb.Original = this;
+			tlb.state_machine = stateMachine;
+			tlb.AddStatement (new Return (iterator, iterator.Location));
+			return tlb;
+		}
+
+		public ParametersBlock ConvertToAsyncTask (IMemberContext context, TypeDefinition host, ParametersCompiled parameters, TypeSpec returnType, TypeSpec delegateType, Location loc)
+		{
+			for (int i = 0; i < parameters.Count; i++) {
+				Parameter p = parameters[i];
+				Parameter.Modifier mod = p.ModFlags;
+				if ((mod & Parameter.Modifier.RefOutMask) != 0) {
+					host.Compiler.Report.Error (1988, p.Location,
+						"Async methods cannot have ref or out parameters");
+					return this;
+				}
+
+				if (p is ArglistParameter) {
+					host.Compiler.Report.Error (4006, p.Location,
+						"__arglist is not allowed in parameter list of async methods");
+					return this;
+				}
+
+				if (parameters.Types[i].IsPointer) {
+					host.Compiler.Report.Error (4005, p.Location,
+						"Async methods cannot have unsafe parameters");
+					return this;
+				}
+			}
+
+			if (!HasAwait) {
+				host.Compiler.Report.Warning (1998, 1, loc,
+					"Async block lacks `await' operator and will run synchronously");
+			}
+
+			var block_type = host.Module.Compiler.BuiltinTypes.Void;
+			var initializer = new AsyncInitializer (this, host, block_type);
+			initializer.Type = block_type;
+			initializer.DelegateType = delegateType;
+
+			var stateMachine = new AsyncTaskStorey (this, context, initializer, returnType);
+
+			state_machine = stateMachine;
+			initializer.SetStateMachine (stateMachine);
+
+			const Flags flags = Flags.CompilerGenerated;
+
+			var b = this is ToplevelBlock ?
+				new ToplevelBlock (host.Compiler, Parameters, Location.Null, flags) :
+				new ParametersBlock (Parent, parameters, Location.Null, flags | Flags.HasAsyncModifier);
+
+			b.Original = this;
+			b.state_machine = stateMachine;
+			b.AddStatement (new AsyncInitializerStatement (initializer));
+			return b;
+		}
+	}
+
+	//
+	//
+	//
+	public class ToplevelBlock : ParametersBlock
+	{
+		LocalVariable this_variable;
+		CompilerContext compiler;
+		Dictionary<string, object> names;
+
+		List<ExplicitBlock> this_references;
+
+		public ToplevelBlock (CompilerContext ctx, Location loc)
+			: this (ctx, ParametersCompiled.EmptyReadOnlyParameters, loc)
+		{
+		}
+
+		public ToplevelBlock (CompilerContext ctx, ParametersCompiled parameters, Location start, Flags flags = 0)
+			: base (parameters, start)
+		{
+			this.compiler = ctx;
+			this.flags = flags;
+			top_block = this;
+
+			ProcessParameters ();
+		}
+
+		//
+		// Recreates a top level block from parameters block. Used for
+		// compiler generated methods where the original block comes from
+		// explicit child block. This works for already resolved blocks
+		// only to ensure we resolve them in the correct flow order
+		//
+		public ToplevelBlock (ParametersBlock source, ParametersCompiled parameters)
+			: base (source, parameters)
+		{
+			this.compiler = source.TopBlock.compiler;
+			top_block = this;
+		}
+
+		public bool IsIterator {
+			get {
+				return (flags & Flags.Iterator) != 0;
+			}
+			set {
+				flags = value ? flags | Flags.Iterator : flags & ~Flags.Iterator;
+			}
+		}
+
+		public Report Report {
+			get {
+				return compiler.Report;
+			}
+		}
+
+		//
+		// Used by anonymous blocks to track references of `this' variable
+		//
+		public List<ExplicitBlock> ThisReferencesFromChildrenBlock {
+			get {
+				return this_references;
+			}
+		}
+
+		//
+		// Returns the "this" instance variable of this block.
+		// See AddThisVariable() for more information.
+		//
+		public LocalVariable ThisVariable {
+			get {
+				return this_variable;
+			}
+		}
+
+		public void AddLocalName (string name, INamedBlockVariable li, bool ignoreChildrenBlocks)
+		{
+			if (names == null)
+				names = new Dictionary<string, object> ();
+
+			object value;
+			if (!names.TryGetValue (name, out value)) {
+				names.Add (name, li);
+				return;
+			}
+
+			INamedBlockVariable existing = value as INamedBlockVariable;
+			List<INamedBlockVariable> existing_list;
+			if (existing != null) {
+				existing_list = new List<INamedBlockVariable> ();
+				existing_list.Add (existing);
+				names[name] = existing_list;
+			} else {
+				existing_list = (List<INamedBlockVariable>) value;
+			}
+
+			//
+			// A collision checking between local names
+			//
+			var variable_block = li.Block.Explicit;
+			for (int i = 0; i < existing_list.Count; ++i) {
+				existing = existing_list[i];
+				Block b = existing.Block.Explicit;
+
+				// Collision at same level
+				if (variable_block == b) {
+					li.Block.Error_AlreadyDeclared (name, li);
+					break;
+				}
+
+				// Collision with parent
+				Block parent = variable_block;
+				while ((parent = parent.Parent) != null) {
+					if (parent == b) {
+						li.Block.Error_AlreadyDeclared (name, li, "parent or current");
+						i = existing_list.Count;
+						break;
+					}
+				}
+
+				if (!ignoreChildrenBlocks && variable_block.Parent != b.Parent) {
+					// Collision with children
+					while ((b = b.Parent) != null) {
+						if (variable_block == b) {
+							li.Block.Error_AlreadyDeclared (name, li, "child");
+							i = existing_list.Count;
+							break;
+						}
+					}
+				}
+			}
+
+			existing_list.Add (li);
+		}
+
+		public void AddLabel (string name, LabeledStatement label)
+		{
+			if (labels == null)
+				labels = new Dictionary<string, object> ();
+
+			object value;
+			if (!labels.TryGetValue (name, out value)) {
+				labels.Add (name, label);
+				return;
+			}
+
+			LabeledStatement existing = value as LabeledStatement;
+			List<LabeledStatement> existing_list;
+			if (existing != null) {
+				existing_list = new List<LabeledStatement> ();
+				existing_list.Add (existing);
+				labels[name] = existing_list;
+			} else {
+				existing_list = (List<LabeledStatement>) value;
+			}
+
+			//
+			// A collision checking between labels
+			//
+			for (int i = 0; i < existing_list.Count; ++i) {
+				existing = existing_list[i];
+				Block b = existing.Block;
+
+				// Collision at same level
+				if (label.Block == b) {
+					Report.SymbolRelatedToPreviousError (existing.loc, name);
+					Report.Error (140, label.loc, "The label `{0}' is a duplicate", name);
+					break;
+				}
+
+				// Collision with parent
+				b = label.Block;
+				while ((b = b.Parent) != null) {
+					if (existing.Block == b) {
+						Report.Error (158, label.loc,
+							"The label `{0}' shadows another label by the same name in a contained scope", name);
+						i = existing_list.Count;
+						break;
+					}
+				}
+
+				// Collision with with children
+				b = existing.Block;
+				while ((b = b.Parent) != null) {
+					if (label.Block == b) {
+						Report.Error (158, label.loc,
+							"The label `{0}' shadows another label by the same name in a contained scope", name);
+						i = existing_list.Count;
+						break;
+					}
+				}
+			}
+
+			existing_list.Add (label);
+		}
+
+		public void AddThisReferenceFromChildrenBlock (ExplicitBlock block)
+		{
+			if (this_references == null)
+				this_references = new List<ExplicitBlock> ();
+
+			if (!this_references.Contains (block))
+				this_references.Add (block);
+		}
+
+		public void RemoveThisReferenceFromChildrenBlock (ExplicitBlock block)
+		{
+			this_references.Remove (block);
+		}
+
+		//
+		// Creates an arguments set from all parameters, useful for method proxy calls
+		//
+		public Arguments GetAllParametersArguments ()
+		{
+			int count = parameters.Count;
+			Arguments args = new Arguments (count);
+			for (int i = 0; i < count; ++i) {
+				var pi = parameter_info[i];
+				var arg_expr = GetParameterReference (i, pi.Location);
+
+				Argument.AType atype_modifier;
+				switch (pi.Parameter.ParameterModifier & Parameter.Modifier.RefOutMask) {
+				case Parameter.Modifier.REF:
+					atype_modifier = Argument.AType.Ref;
+					break;
+				case Parameter.Modifier.OUT:
+					atype_modifier = Argument.AType.Out;
+					break;
+				default:
+					atype_modifier = 0;
+					break;
+				}
+
+				args.Add (new Argument (arg_expr, atype_modifier));
+			}
+
+			return args;
+		}
+
+		//
+		// Lookup inside a block, the returned value can represent 3 states
+		//
+		// true+variable: A local name was found and it's valid
+		// false+variable: A local name was found in a child block only
+		// false+null: No local name was found
+		//
+		public bool GetLocalName (string name, Block block, ref INamedBlockVariable variable)
+		{
+			if (names == null)
+				return false;
+
+			object value;
+			if (!names.TryGetValue (name, out value))
+				return false;
+
+			variable = value as INamedBlockVariable;
+			Block b = block;
+			if (variable != null) {
+				do {
+					if (variable.Block == b.Original)
+						return true;
+
+					b = b.Parent;
+				} while (b != null);
+
+				b = variable.Block;
+				do {
+					if (block == b)
+						return false;
+
+					b = b.Parent;
+				} while (b != null);
+			} else {
+				List<INamedBlockVariable> list = (List<INamedBlockVariable>) value;
+				for (int i = 0; i < list.Count; ++i) {
+					variable = list[i];
+					do {
+						if (variable.Block == b.Original)
+							return true;
+
+						b = b.Parent;
+					} while (b != null);
+
+					b = variable.Block;
+					do {
+						if (block == b)
+							return false;
+
+						b = b.Parent;
+					} while (b != null);
+
+					b = block;
+				}
+			}
+
+			variable = null;
+			return false;
+		}
+
+		public void IncludeBlock (ParametersBlock pb, ToplevelBlock block)
+		{
+			if (block.names != null) {
+				foreach (var n in block.names) {
+					var variable = n.Value as INamedBlockVariable;
+					if (variable != null) {
+						if (variable.Block.ParametersBlock == pb)
+							AddLocalName (n.Key, variable, false);
+						continue;
+					}
+
+					foreach (var v in (List<INamedBlockVariable>) n.Value)
+						if (v.Block.ParametersBlock == pb)
+							AddLocalName (n.Key, v, false);
+				}
+			}
 		}
 
 		// <summary>
@@ -2786,125 +4329,26 @@ namespace Mono.CSharp {
 		//   analysis code to ensure that it's been fully initialized before control
 		//   leaves the constructor.
 		// </summary>
-		public LocalInfo AddThisVariable (DeclSpace ds, Location l)
+		public void AddThisVariable (BlockContext bc)
 		{
-			if (this_variable == null) {
-				this_variable = new LocalInfo (ds, this, l);
-				this_variable.Used = true;
-				this_variable.IsThis = true;
+			if (this_variable != null)
+				throw new InternalErrorException (StartLocation.ToString ());
 
-				Variables.Add ("this", this_variable);
-			}
-
-			return this_variable;
+			this_variable = new LocalVariable (this, "this", LocalVariable.Flags.IsThis | LocalVariable.Flags.Used, StartLocation);
+			this_variable.Type = bc.CurrentType;
+			this_variable.PrepareAssignmentAnalysis (bc);
 		}
 
-		public bool IsIterator {
-			get { return (flags & Flags.IsIterator) != 0; }
-			set { flags = value ? flags | Flags.IsIterator : flags & ~Flags.IsIterator; }
-		}
-
-		public bool IsThisAssigned (BlockContext ec)
+		public override void CheckControlExit (FlowAnalysisContext fc, DefiniteAssignmentBitSet dat)
 		{
-			return this_variable == null || this_variable.IsThisAssigned (ec, this);
-		}
+			//
+			// If we're a non-static struct constructor which doesn't have an
+			// initializer, then we must initialize all of the struct's fields.
+			//
+			if (this_variable != null)
+				this_variable.IsThisAssigned (fc, this);
 
-		public bool Resolve (FlowBranching parent, BlockContext rc, ParametersCompiled ip, IMethodData md)
-		{
-			if (resolved)
-				return true;
-
-			resolved = true;
-
-			try {
-				if (!ResolveMeta (rc, ip))
-					return false;
-
-				using (rc.With (ResolveContext.Options.DoFlowAnalysis, true)) {
-					FlowBranchingToplevel top_level = rc.StartFlowBranching (this, parent);
-
-					if (!Resolve (rc))
-						return false;
-
-					unreachable = top_level.End ();
-				}
-			} catch (Exception) {
-#if PRODUCTION
-				if (rc.CurrentBlock != null) {
-					ec.Report.Error (584, rc.CurrentBlock.StartLocation, "Internal compiler error: Phase Resolve");
-				} else {
-					ec.Report.Error (587, "Internal compiler error: Phase Resolve");
-				}
-#endif
-				throw;
-			}
-
-			if (rc.ReturnType != TypeManager.void_type && !unreachable) {
-				if (rc.CurrentAnonymousMethod == null) {
-					rc.Report.Error (161, md.Location, "`{0}': not all code paths return a value", md.GetSignatureForError ());
-					return false;
-				} else if (!rc.CurrentAnonymousMethod.IsIterator) {
-					rc.Report.Error (1643, rc.CurrentAnonymousMethod.Location, "Not all code paths return a value in anonymous method of type `{0}'",
-							  rc.CurrentAnonymousMethod.GetSignatureForError ());
-					return false;
-				}
-			}
-
-			return true;
-		}
-
-		bool ResolveMeta (BlockContext ec, ParametersCompiled ip)
-		{
-			int errors = ec.Report.Errors;
-			int orig_count = parameters.Count;
-
-			if (ip != null)
-				parameters = ip;
-
-			// Assert: orig_count != parameter.Count => orig_count == 0
-			if (orig_count != 0 && orig_count != parameters.Count)
-				throw new InternalErrorException ("parameter information mismatch");
-
-			int offset = Parent == null ? 0 : Parent.AssignableSlots;
-
-			for (int i = 0; i < orig_count; ++i) {
-				Parameter.Modifier mod = parameters.FixedParameters [i].ModFlags;
-
-				if ((mod & Parameter.Modifier.OUT) != Parameter.Modifier.OUT)
-					continue;
-
-				VariableInfo vi = new VariableInfo (ip, i, offset);
-				parameter_info [i].VariableInfo = vi;
-				offset += vi.Length;
-			}
-
-			ResolveMeta (ec, offset);
-
-			return ec.Report.Errors == errors;
-		}
-
-		// <summary>
-		//   Check whether all `out' parameters have been assigned.
-		// </summary>
-		public void CheckOutParameters (FlowBranching.UsageVector vector, Location loc)
-		{
-			if (vector.IsUnreachable)
-				return;
-
-			int n = parameter_info == null ? 0 : parameter_info.Length;
-
-			for (int i = 0; i < n; i++) {
-				VariableInfo var = parameter_info [i].VariableInfo;
-
-				if (var == null)
-					continue;
-
-				if (vector.IsAssigned (var, false))
-					continue;
-
-				Report.Error (177, loc, "The out parameter `{0}' must be assigned to before control leaves the current method",
-					var.Name);
-			}
+			base.CheckControlExit (fc, dat);
 		}
 
 		public override void Emit (EmitContext ec)
@@ -2912,88 +4356,84 @@ namespace Mono.CSharp {
 			if (Report.Errors > 0)
 				return;
 
-#if PRODUCTION
 			try {
-#endif
-			EmitMeta (ec);
-
-			if (ec.HasReturnLabel)
-				ec.ReturnLabel = ec.ig.DefineLabel ();
-
-			base.Emit (ec);
-
-			ec.Mark (EndLocation);
-
-			if (ec.HasReturnLabel)
-				ec.ig.MarkLabel (ec.ReturnLabel);
-
-			if (ec.return_value != null) {
-				ec.ig.Emit (OpCodes.Ldloc, ec.return_value);
-				ec.ig.Emit (OpCodes.Ret);
-			} else {
-				//
-				// If `HasReturnLabel' is set, then we already emitted a
-				// jump to the end of the method, so we must emit a `ret'
-				// there.
-				//
-				// Unfortunately, System.Reflection.Emit automatically emits
-				// a leave to the end of a finally block.  This is a problem
-				// if no code is following the try/finally block since we may
-				// jump to a point after the end of the method.
-				// As a workaround, we're always creating a return label in
-				// this case.
-				//
-
-				if (ec.HasReturnLabel || !unreachable) {
-					if (ec.ReturnType != TypeManager.void_type)
-						ec.ig.Emit (OpCodes.Ldloc, ec.TemporaryReturn ());
-					ec.ig.Emit (OpCodes.Ret);
+			if (IsCompilerGenerated) {
+				using (ec.With (BuilderContext.Options.OmitDebugInfo, true)) {
+					base.Emit (ec);
 				}
+			} else {
+				base.Emit (ec);
 			}
 
-#if PRODUCTION
-			} catch (Exception e){
-				Console.WriteLine ("Exception caught by the compiler while emitting:");
-				Console.WriteLine ("   Block that caused the problem begin at: " + block.loc);
-					
-				Console.WriteLine (e.GetType ().FullName + ": " + e.Message);
-				throw;
+			//
+			// If `HasReturnLabel' is set, then we already emitted a
+			// jump to the end of the method, so we must emit a `ret'
+			// there.
+			//
+			// Unfortunately, System.Reflection.Emit automatically emits
+			// a leave to the end of a finally block.  This is a problem
+			// if no code is following the try/finally block since we may
+			// jump to a point after the end of the method.
+			// As a workaround, we're always creating a return label in
+			// this case.
+			//
+			if (ec.HasReturnLabel || HasReachableClosingBrace) {
+				if (ec.HasReturnLabel)
+					ec.MarkLabel (ec.ReturnLabel);
+
+				if (ec.EmitAccurateDebugInfo && !IsCompilerGenerated)
+					ec.Mark (EndLocation);
+
+				if (ec.ReturnType.Kind != MemberKind.Void)
+					ec.Emit (OpCodes.Ldloc, ec.TemporaryReturn ());
+
+				ec.Emit (OpCodes.Ret);
 			}
-#endif
+
+			} catch (Exception e) {
+				throw new InternalErrorException (e, StartLocation);
+			}
 		}
 
-		public override void EmitMeta (EmitContext ec)
+		public bool Resolve (BlockContext bc, IMethodData md)
 		{
-			parameters.ResolveVariable ();
+			if (resolved)
+				return true;
 
-			// Avoid declaring an IL variable for this_variable since it is not accessed
-			// from the generated IL
-			if (this_variable != null)
-				Variables.Remove ("this");
-			base.EmitMeta (ec);
-		}
+			var errors = bc.Report.Errors;
 
-		protected override void EmitSymbolInfo (EmitContext ec)
-		{
-			AnonymousExpression ae = ec.CurrentAnonymousMethod;
-			if ((ae != null) && (ae.Storey != null))
-				SymbolWriter.DefineScopeVariable (ae.Storey.ID);
+			base.Resolve (bc);
 
-			base.EmitSymbolInfo (ec);
+			if (bc.Report.Errors > errors)
+				return false;
+
+			MarkReachable (new Reachability ());
+
+			if (HasReachableClosingBrace && bc.ReturnType.Kind != MemberKind.Void) {
+				// TODO: var md = bc.CurrentMemberDefinition;
+				bc.Report.Error (161, md.Location, "`{0}': not all code paths return a value", md.GetSignatureForError ());
+			}
+
+			if ((flags & Flags.NoFlowAnalysis) != 0)
+				return true;
+
+			var fc = new FlowAnalysisContext (bc.Module.Compiler, this, bc.AssignmentInfoOffset);
+			try {
+				FlowAnalysis (fc);
+			} catch (Exception e) {
+				throw new InternalErrorException (e, StartLocation);
+			}
+
+			return true;
 		}
 	}
 	
-	public class SwitchLabel {
+	public class SwitchLabel : Statement
+	{
+		Constant converted;
 		Expression label;
-		object converted;
-		Location loc;
 
-		Label il_label;
-		bool  il_label_set;
-		Label il_label_code;
-		bool  il_label_code_set;
-
-		public static readonly object NullStringCase = new object ();
+		Label? il_label;
 
 		//
 		// if expr == null, then it is the default case.
@@ -3004,6 +4444,12 @@ namespace Mono.CSharp {
 			loc = l;
 		}
 
+		public bool IsDefault {
+			get {
+				return label == null;
+			}
+		}
+
 		public Expression Label {
 			get {
 				return label;
@@ -3011,211 +4457,333 @@ namespace Mono.CSharp {
 		}
 
 		public Location Location {
-			get { return loc; }
+			get {
+				return loc;
+			}
 		}
 
-		public object Converted {
+		public Constant Converted {
 			get {
 				return converted;
 			}
+			set {
+				converted = value; 
+			}
 		}
+
+		public bool PatternMatching { get; set; }
+
+		public bool SectionStart { get; set; }
 
 		public Label GetILLabel (EmitContext ec)
 		{
-			if (!il_label_set){
-				il_label = ec.ig.DefineLabel ();
-				il_label_set = true;
+			if (il_label == null){
+				il_label = ec.DefineLabel ();
 			}
-			return il_label;
+
+			return il_label.Value;
 		}
 
-		public Label GetILLabelCode (EmitContext ec)
+		protected override void DoEmit (EmitContext ec)
 		{
-			if (!il_label_code_set){
-				il_label_code = ec.ig.DefineLabel ();
-				il_label_code_set = true;
-			}
-			return il_label_code;
-		}				
-		
+			ec.MarkLabel (GetILLabel (ec));
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			if (!SectionStart)
+				return false;
+
+			fc.DefiniteAssignment = new DefiniteAssignmentBitSet (fc.SwitchInitialDefinitiveAssignment);
+			return false;
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			if (ResolveAndReduce (bc))
+				bc.Switch.RegisterLabel (bc, this);
+
+			return true;
+		}
+
 		//
 		// Resolves the expression, reduces it to a literal if possible
 		// and then converts it to the requested type.
 		//
-		public bool ResolveAndReduce (ResolveContext ec, Type required_type, bool allow_nullable)
-		{	
-			Expression e = label.Resolve (ec);
-
-			if (e == null)
-				return false;
-
-			Constant c = e as Constant;
-			if (c == null){
-				ec.Report.Error (150, loc, "A constant value is expected");
-				return false;
-			}
-
-			if (required_type == TypeManager.string_type && c.GetValue () == null) {
-				converted = NullStringCase;
+		bool ResolveAndReduce (BlockContext bc)
+		{
+			if (IsDefault)
 				return true;
+
+			var switch_statement = bc.Switch;
+
+			if (PatternMatching) {
+				label = new Is (switch_statement.ExpressionValue, label, loc).Resolve (bc);
+				return label != null;
 			}
 
-			if (allow_nullable && c.GetValue () == null) {
-				converted = NullStringCase;
-				return true;
-			}
-			
-			c = c.ImplicitConversionRequired (ec, required_type, loc);
+			var c = label.ResolveLabelConstant (bc);
 			if (c == null)
 				return false;
 
-			converted = c.GetValue ();
-			return true;
+			if (switch_statement.IsNullable && c is NullLiteral) {
+				converted = c;
+				return true;
+			}
+
+			if (switch_statement.IsPatternMatching) {
+				label = new Is (switch_statement.ExpressionValue, label, loc).Resolve (bc);
+				return true;
+			}
+
+			converted = c.ImplicitConversionRequired (bc, switch_statement.SwitchType);
+			return converted != null;
 		}
 
-		public void Error_AlreadyOccurs (ResolveContext ec, Type switch_type, SwitchLabel collision_with)
+		public void Error_AlreadyOccurs (ResolveContext ec, SwitchLabel collision_with)
+		{
+			ec.Report.SymbolRelatedToPreviousError (collision_with.loc, null);
+			ec.Report.Error (152, loc, "The label `{0}' already occurs in this switch statement", GetSignatureForError ());
+		}
+
+		protected override void CloneTo (CloneContext clonectx, Statement target)
+		{
+			var t = (SwitchLabel) target;
+			if (label != null)
+				t.label = label.Clone (clonectx);
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+
+		public string GetSignatureForError ()
 		{
 			string label;
 			if (converted == null)
 				label = "default";
-			else if (converted == NullStringCase)
-				label = "null";
 			else
-				label = converted.ToString ();
-			
-			ec.Report.SymbolRelatedToPreviousError (collision_with.loc, null);
-			ec.Report.Error (152, loc, "The label `case {0}:' already occurs in this switch statement", label);
-		}
+				label = converted.GetValueAsLiteral ();
 
-		public SwitchLabel Clone (CloneContext clonectx)
-		{
-			return new SwitchLabel (label.Clone (clonectx), loc);
+			return string.Format ("case {0}:", label);
 		}
 	}
 
-	public class SwitchSection {
-		// An array of SwitchLabels.
-		public readonly ArrayList Labels;
-		public readonly Block Block;
-		
-		public SwitchSection (ArrayList labels, Block block)
+	public class Switch : LoopStatement
+	{
+		// structure used to hold blocks of keys while calculating table switch
+		sealed class LabelsRange : IComparable<LabelsRange>
 		{
-			Labels = labels;
-			Block = block;
+			public readonly long min;
+			public long max;
+			public readonly List<long> label_values;
+
+			public LabelsRange (long value)
+			{
+				min = max = value;
+				label_values = new List<long> ();
+				label_values.Add (value);
+			}
+
+			public LabelsRange (long min, long max, ICollection<long> values)
+			{
+				this.min = min;
+				this.max = max;
+				this.label_values = new List<long> (values);
+			}
+
+			public long Range {
+				get {
+					return max - min + 1;
+				}
+			}
+
+			public bool AddValue (long value)
+			{
+				var gap = value - min + 1;
+				// Ensure the range has > 50% occupancy
+				if (gap > 2 * (label_values.Count + 1) || gap <= 0)
+					return false;
+
+				max = value;
+				label_values.Add (value);
+				return true;
+			}
+
+			public int CompareTo (LabelsRange other)
+			{
+				int nLength = label_values.Count;
+				int nLengthOther = other.label_values.Count;
+				if (nLengthOther == nLength)
+					return (int) (other.min - min);
+
+				return nLength - nLengthOther;
+			}
 		}
 
-		public SwitchSection Clone (CloneContext clonectx)
+		sealed class DispatchStatement : Statement
 		{
-			ArrayList cloned_labels = new ArrayList ();
+			readonly Switch body;
 
-			foreach (SwitchLabel sl in cloned_labels)
-				cloned_labels.Add (sl.Clone (clonectx));
-			
-			return new SwitchSection (cloned_labels, clonectx.LookupBlock (Block));
+			public DispatchStatement (Switch body)
+			{
+				this.body = body;
+			}
+
+			protected override void CloneTo (CloneContext clonectx, Statement target)
+			{
+				throw new NotImplementedException ();
+			}
+
+			protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+			{
+				return false;
+			}
+
+			protected override void DoEmit (EmitContext ec)
+			{
+				body.EmitDispatch (ec);
+			}
 		}
-	}
-	
-	public class Switch : Statement {
-		public ArrayList Sections;
+
+		class MissingBreak : Statement
+		{
+			readonly SwitchLabel label;
+
+			public MissingBreak (SwitchLabel sl)
+			{
+				this.label = sl;
+				this.loc = sl.loc;
+			}
+
+			public bool FallOut { get; set; }
+
+			protected override void DoEmit (EmitContext ec)
+			{
+			}
+
+			protected override void CloneTo (CloneContext clonectx, Statement target)
+			{
+			}
+
+			protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+			{
+				if (FallOut) {
+					fc.Report.Error (8070, loc, "Control cannot fall out of switch statement through final case label `{0}'",
+						label.GetSignatureForError ());
+				} else {
+					fc.Report.Error (163, loc, "Control cannot fall through from one case label `{0}' to another",
+						label.GetSignatureForError ());
+				}
+				return true;
+			}
+		}
+
 		public Expression Expr;
 
-		/// <summary>
-		///   Maps constants whose type type SwitchType to their  SwitchLabels.
-		/// </summary>
-		public IDictionary Elements;
+		//
+		// Mapping of all labels to their SwitchLabels
+		//
+		Dictionary<long, SwitchLabel> labels;
+		Dictionary<string, SwitchLabel> string_labels;
+		List<SwitchLabel> case_labels;
+
+		List<Tuple<GotoCase, Constant>> goto_cases;
+		List<DefiniteAssignmentBitSet> end_reachable_das;
 
 		/// <summary>
 		///   The governing switch type
 		/// </summary>
-		public Type SwitchType;
+		public TypeSpec SwitchType;
 
-		//
-		// Computed
-		//
-		Label default_target;
-		Label null_target;
 		Expression new_expr;
-		bool is_constant;
-		bool has_null_case;
-		SwitchSection constant_section;
-		SwitchSection default_section;
 
+		SwitchLabel case_null;
+		SwitchLabel case_default;
+
+		Label defaultLabel, nullLabel;
+		VariableReference value;
 		ExpressionStatement string_dictionary;
 		FieldExpr switch_cache_field;
-		static int unique_counter;
+		ExplicitBlock block;
+		bool end_reachable;
 
 		//
 		// Nullable Types support
 		//
 		Nullable.Unwrap unwrap;
 
-		protected bool HaveUnwrap {
-			get { return unwrap != null; }
-		}
-
-		//
-		// The types allowed to be implicitly cast from
-		// on the governing type
-		//
-		static Type [] allowed_types;
-		
-		public Switch (Expression e, ArrayList sects, Location l)
+		public Switch (Expression e, ExplicitBlock block, Location l)
+			: base (block)
 		{
 			Expr = e;
-			Sections = sects;
+			this.block = block;
 			loc = l;
 		}
 
-		public bool GotDefault {
+		public SwitchLabel ActiveLabel { get; set; }
+
+		public ExplicitBlock Block {
 			get {
-				return default_section != null;
+				return block;
 			}
 		}
 
-		public Label DefaultTarget {
+		public SwitchLabel DefaultLabel {
 			get {
-				return default_target;
+				return case_default;
+			}
+		}
+
+		public bool IsNullable {
+			get {
+				return unwrap != null;
+			}
+		}
+
+		public bool IsPatternMatching {
+			get {
+				return new_expr == null && SwitchType != null;
+			}
+		}
+
+		public List<SwitchLabel> RegisteredLabels {
+			get {
+				return case_labels;
+			}
+		}
+
+		public VariableReference ExpressionValue {
+			get {
+				return value;
 			}
 		}
 
 		//
 		// Determines the governing type for a switch.  The returned
 		// expression might be the expression from the switch, or an
-		// expression that includes any potential conversions to the
-		// integral types or to string.
+		// expression that includes any potential conversions to
 		//
-		Expression SwitchGoverningType (ResolveContext ec, Expression expr)
+		static Expression SwitchGoverningType (ResolveContext rc, Expression expr, bool unwrapExpr)
 		{
-			Type t = expr.Type;
-
-			if (t == TypeManager.byte_type ||
-			    t == TypeManager.sbyte_type ||
-			    t == TypeManager.ushort_type ||
-			    t == TypeManager.short_type ||
-			    t == TypeManager.uint32_type ||
-			    t == TypeManager.int32_type ||
-			    t == TypeManager.uint64_type ||
-			    t == TypeManager.int64_type ||
-			    t == TypeManager.char_type ||
-			    t == TypeManager.string_type ||
-			    t == TypeManager.bool_type ||
-			    TypeManager.IsEnumType (t))
+			switch (expr.Type.BuiltinType) {
+			case BuiltinTypeSpec.Type.Byte:
+			case BuiltinTypeSpec.Type.SByte:
+			case BuiltinTypeSpec.Type.UShort:
+			case BuiltinTypeSpec.Type.Short:
+			case BuiltinTypeSpec.Type.UInt:
+			case BuiltinTypeSpec.Type.Int:
+			case BuiltinTypeSpec.Type.ULong:
+			case BuiltinTypeSpec.Type.Long:
+			case BuiltinTypeSpec.Type.Char:
+			case BuiltinTypeSpec.Type.String:
+			case BuiltinTypeSpec.Type.Bool:
 				return expr;
-
-			if (allowed_types == null){
-				allowed_types = new Type [] {
-					TypeManager.sbyte_type,
-					TypeManager.byte_type,
-					TypeManager.short_type,
-					TypeManager.ushort_type,
-					TypeManager.int32_type,
-					TypeManager.uint32_type,
-					TypeManager.int64_type,
-					TypeManager.uint64_type,
-					TypeManager.char_type,
-					TypeManager.string_type
-				};
 			}
+
+			if (expr.Type.IsEnum)
+				return expr;
 
 			//
 			// Try to find a *user* defined implicit conversion.
@@ -3224,10 +4792,18 @@ namespace Mono.CSharp {
 			// conversions, we have to report an error
 			//
 			Expression converted = null;
-			foreach (Type tt in allowed_types){
-				Expression e;
-				
-				e = Convert.ImplicitUserConversion (ec, expr, tt, loc);
+			foreach (TypeSpec tt in rc.Module.PredefinedTypes.SwitchUserTypes) {
+
+				if (!unwrapExpr && tt.IsNullableType && expr.Type.IsNullableType)
+					break;
+
+				var restr = Convert.UserConversionRestriction.ImplicitOnly |
+					Convert.UserConversionRestriction.ProbingOnly;
+
+				if (unwrapExpr)
+					restr |= Convert.UserConversionRestriction.NullableSourceOnly;
+
+				var e = Convert.UserDefinedConversion (rc, expr, tt, restr, Location.Null);
 				if (e == null)
 					continue;
 
@@ -3235,11 +4811,12 @@ namespace Mono.CSharp {
 				// Ignore over-worked ImplicitUserConversions that do
 				// an implicit conversion in addition to the user conversion.
 				// 
-				if (!(e is UserCast))
+				var uc = e as UserCast;
+				if (uc == null)
 					continue;
 
 				if (converted != null){
-					ec.Report.ExtraInformation (loc, "(Ambiguous implicit user defined conversion in previous ");
+//					rc.Report.ExtraInformation (loc, "(Ambiguous implicit user defined conversion in previous ");
 					return null;
 				}
 
@@ -3248,362 +4825,259 @@ namespace Mono.CSharp {
 			return converted;
 		}
 
-		//
-		// Performs the basic sanity checks on the switch statement
-		// (looks for duplicate keys and non-constant expressions).
-		//
-		// It also returns a hashtable with the keys that we will later
-		// use to compute the switch tables
-		//
-		bool CheckSwitch (ResolveContext ec)
+		public static TypeSpec[] CreateSwitchUserTypes (ModuleContainer module, TypeSpec nullable)
 		{
-			bool error = false;
-			Elements = Sections.Count > 10 ? 
-				(IDictionary)new Hashtable () : 
-				(IDictionary)new ListDictionary ();
-				
-			foreach (SwitchSection ss in Sections){
-				foreach (SwitchLabel sl in ss.Labels){
-					if (sl.Label == null){
-						if (default_section != null){
-							sl.Error_AlreadyOccurs (ec, SwitchType, (SwitchLabel)default_section.Labels [0]);
-							error = true;
-						}
-						default_section = ss;
-						continue;
-					}
+			var types = module.Compiler.BuiltinTypes;
 
-					if (!sl.ResolveAndReduce (ec, SwitchType, HaveUnwrap)) {
-						error = true;
-						continue;
-					}
-					
-					object key = sl.Converted;
-					if (key == SwitchLabel.NullStringCase)
-						has_null_case = true;
+			// LAMESPEC: For some reason it does not contain bool which looks like csc bug
+			TypeSpec[] stypes = new[] {
+				types.SByte,
+				types.Byte,
+				types.Short,
+				types.UShort,
+				types.Int,
+				types.UInt,
+				types.Long,
+				types.ULong,
+				types.Char,
+				types.String
+			};
 
-					try {
-						Elements.Add (key, sl);
-					} catch (ArgumentException) {
-						sl.Error_AlreadyOccurs (ec, SwitchType, (SwitchLabel)Elements [key]);
-						error = true;
-					}
+			if (nullable != null) {
+
+				Array.Resize (ref stypes, stypes.Length + 9);
+
+				for (int i = 0; i < 9; ++i) {
+					stypes [10 + i] = nullable.MakeGenericType (module, new [] { stypes [i] });
 				}
 			}
-			return !error;
+
+			return stypes;
 		}
 
-		void EmitObjectInteger (ILGenerator ig, object k)
+		public void RegisterLabel (BlockContext rc, SwitchLabel sl)
 		{
-			if (k is int)
-				IntConstant.EmitInt (ig, (int) k);
-			else if (k is Constant) {
-				EmitObjectInteger (ig, ((Constant) k).GetValue ());
-			} 
-			else if (k is uint)
-				IntConstant.EmitInt (ig, unchecked ((int) (uint) k));
-			else if (k is long)
-			{
-				if ((long) k >= int.MinValue && (long) k <= int.MaxValue)
-				{
-					IntConstant.EmitInt (ig, (int) (long) k);
-					ig.Emit (OpCodes.Conv_I8);
+			case_labels.Add (sl);
+
+			if (sl.IsDefault) {
+				if (case_default != null) {
+					sl.Error_AlreadyOccurs (rc, case_default);
+				} else {
+					case_default = sl;
 				}
-				else
-					LongConstant.EmitLong (ig, (long) k);
+
+				return;
 			}
-			else if (k is ulong)
-			{
-				ulong ul = (ulong) k;
-				if (ul < (1L<<32))
-				{
-					IntConstant.EmitInt (ig, unchecked ((int) ul));
-					ig.Emit (OpCodes.Conv_U8);
+
+			if (sl.Converted == null)
+				return;
+
+			try {
+				if (string_labels != null) {
+					string string_value = sl.Converted.GetValue () as string;
+					if (string_value == null)
+						case_null = sl;
+					else
+						string_labels.Add (string_value, sl);
+				} else {
+					if (sl.Converted.IsNull) {
+						case_null = sl;
+					} else {
+						labels.Add (sl.Converted.GetValueAsLong (), sl);
+					}
 				}
+			} catch (ArgumentException) {
+				if (string_labels != null)
+					sl.Error_AlreadyOccurs (rc, string_labels[(string) sl.Converted.GetValue ()]);
 				else
-				{
-					LongConstant.EmitLong (ig, unchecked ((long) ul));
-				}
+					sl.Error_AlreadyOccurs (rc, labels[sl.Converted.GetValueAsLong ()]);
 			}
-			else if (k is char)
-				IntConstant.EmitInt (ig, (int) ((char) k));
-			else if (k is sbyte)
-				IntConstant.EmitInt (ig, (int) ((sbyte) k));
-			else if (k is byte)
-				IntConstant.EmitInt (ig, (int) ((byte) k));
-			else if (k is short)
-				IntConstant.EmitInt (ig, (int) ((short) k));
-			else if (k is ushort)
-				IntConstant.EmitInt (ig, (int) ((ushort) k));
-			else if (k is bool)
-				IntConstant.EmitInt (ig, ((bool) k) ? 1 : 0);
-			else
-				throw new Exception ("Unhandled case");
 		}
 		
-		// structure used to hold blocks of keys while calculating table switch
-		class KeyBlock : IComparable
+		//
+		// This method emits code for a lookup-based switch statement (non-string)
+		// Basically it groups the cases into blocks that are at least half full,
+		// and then spits out individual lookup opcodes for each block.
+		// It emits the longest blocks first, and short blocks are just
+		// handled with direct compares.
+		//
+		void EmitTableSwitch (EmitContext ec, Expression val)
 		{
-			public KeyBlock (long _first)
-			{
-				first = last = _first;
-			}
-			public long first;
-			public long last;
-			public ArrayList element_keys = null;
-			// how many items are in the bucket
-			public int Size = 1;
-			public int Length
-			{
-				get { return (int) (last - first + 1); }
-			}
-			public static long TotalLength (KeyBlock kb_first, KeyBlock kb_last)
-			{
-				return kb_last.last - kb_first.first + 1;
-			}
-			public int CompareTo (object obj)
-			{
-				KeyBlock kb = (KeyBlock) obj;
-				int nLength = Length;
-				int nLengthOther = kb.Length;
-				if (nLengthOther == nLength)
-					return (int) (kb.first - first);
-				return nLength - nLengthOther;
-			}
-		}
+			if (labels != null && labels.Count > 0) {
+				List<LabelsRange> ranges;
+				if (string_labels != null) {
+					// We have done all hard work for string already
+					// setup single range only
+					ranges = new List<LabelsRange> (1);
+					ranges.Add (new LabelsRange (0, labels.Count - 1, labels.Keys));
+				} else {
+					var element_keys = new long[labels.Count];
+					labels.Keys.CopyTo (element_keys, 0);
+					Array.Sort (element_keys);
 
-		/// <summary>
-		/// This method emits code for a lookup-based switch statement (non-string)
-		/// Basically it groups the cases into blocks that are at least half full,
-		/// and then spits out individual lookup opcodes for each block.
-		/// It emits the longest blocks first, and short blocks are just
-		/// handled with direct compares.
-		/// </summary>
-		/// <param name="ec"></param>
-		/// <param name="val"></param>
-		/// <returns></returns>
-		void TableSwitchEmit (EmitContext ec, Expression val)
-		{
-			int element_count = Elements.Count;
-			object [] element_keys = new object [element_count];
-			Elements.Keys.CopyTo (element_keys, 0);
-			Array.Sort (element_keys);
+					//
+					// Build possible ranges of switch labes to reduce number
+					// of comparisons
+					//
+					ranges = new List<LabelsRange> (element_keys.Length);
+					var range = new LabelsRange (element_keys[0]);
+					ranges.Add (range);
+					for (int i = 1; i < element_keys.Length; ++i) {
+						var l = element_keys[i];
+						if (range.AddValue (l))
+							continue;
 
-			// initialize the block list with one element per key
-			ArrayList key_blocks = new ArrayList (element_count);
-			foreach (object key in element_keys)
-				key_blocks.Add (new KeyBlock (System.Convert.ToInt64 (key)));
-
-			KeyBlock current_kb;
-			// iteratively merge the blocks while they are at least half full
-			// there's probably a really cool way to do this with a tree...
-			while (key_blocks.Count > 1)
-			{
-				ArrayList key_blocks_new = new ArrayList ();
-				current_kb = (KeyBlock) key_blocks [0];
-				for (int ikb = 1; ikb < key_blocks.Count; ikb++)
-				{
-					KeyBlock kb = (KeyBlock) key_blocks [ikb];
-					if ((current_kb.Size + kb.Size) * 2 >=  KeyBlock.TotalLength (current_kb, kb))
-					{
-						// merge blocks
-						current_kb.last = kb.last;
-						current_kb.Size += kb.Size;
+						range = new LabelsRange (l);
+						ranges.Add (range);
 					}
-					else
-					{
-						// start a new block
-						key_blocks_new.Add (current_kb);
-						current_kb = kb;
-					}
+
+					// sort the blocks so we can tackle the largest ones first
+					ranges.Sort ();
 				}
-				key_blocks_new.Add (current_kb);
-				if (key_blocks.Count == key_blocks_new.Count)
-					break;
-				key_blocks = key_blocks_new;
-			}
 
-			// initialize the key lists
-			foreach (KeyBlock kb in key_blocks)
-				kb.element_keys = new ArrayList ();
+				Label lbl_default = defaultLabel;
+				TypeSpec compare_type = SwitchType.IsEnum ? EnumSpec.GetUnderlyingType (SwitchType) : SwitchType;
 
-			// fill the key lists
-			int iBlockCurr = 0;
-			if (key_blocks.Count > 0) {
-				current_kb = (KeyBlock) key_blocks [0];
-				foreach (object key in element_keys)
-				{
-					bool next_block = (key is UInt64) ? (ulong) key > (ulong) current_kb.last :
-						System.Convert.ToInt64 (key) > current_kb.last;
-					if (next_block)
-						current_kb = (KeyBlock) key_blocks [++iBlockCurr];
-					current_kb.element_keys.Add (key);
-				}
-			}
+				for (int range_index = ranges.Count - 1; range_index >= 0; --range_index) {
+					LabelsRange kb = ranges[range_index];
+					lbl_default = (range_index == 0) ? defaultLabel : ec.DefineLabel ();
 
-			// sort the blocks so we can tackle the largest ones first
-			key_blocks.Sort ();
+					// Optimize small ranges using simple equality check
+					if (kb.Range <= 2) {
+						foreach (var key in kb.label_values) {
+							SwitchLabel sl = labels[key];
+							if (sl == case_default || sl == case_null)
+								continue;
 
-			// okay now we can start...
-			ILGenerator ig = ec.ig;
-			Label lbl_end = ig.DefineLabel ();	// at the end ;-)
-			Label lbl_default = default_target;
+							if (sl.Converted.IsZeroInteger) {
+								val.EmitBranchable (ec, sl.GetILLabel (ec), false);
+							} else {
+								val.Emit (ec);
+								sl.Converted.Emit (ec);
+								ec.Emit (OpCodes.Beq, sl.GetILLabel (ec));
+							}
+						}
+					} else {
+						// TODO: if all the keys in the block are the same and there are
+						//       no gaps/defaults then just use a range-check.
+						if (compare_type.BuiltinType == BuiltinTypeSpec.Type.Long || compare_type.BuiltinType == BuiltinTypeSpec.Type.ULong) {
+							// TODO: optimize constant/I4 cases
 
-			Type type_keys = null;
-			if (element_keys.Length > 0)
-				type_keys = element_keys [0].GetType ();	// used for conversions
-
-			Type compare_type;
-			
-			if (TypeManager.IsEnumType (SwitchType))
-				compare_type = TypeManager.GetEnumUnderlyingType (SwitchType);
-			else
-				compare_type = SwitchType;
-			
-			for (int iBlock = key_blocks.Count - 1; iBlock >= 0; --iBlock)
-			{
-				KeyBlock kb = ((KeyBlock) key_blocks [iBlock]);
-				lbl_default = (iBlock == 0) ? default_target : ig.DefineLabel ();
-				if (kb.Length <= 2)
-				{
-					foreach (object key in kb.element_keys) {
-						SwitchLabel sl = (SwitchLabel) Elements [key];
-						if (key is int && (int) key == 0) {
-							val.EmitBranchable (ec, sl.GetILLabel (ec), false);
-						} else {
+							// check block range (could be > 2^31)
 							val.Emit (ec);
-							EmitObjectInteger (ig, key);
-							ig.Emit (OpCodes.Beq, sl.GetILLabel (ec));
-						}
-					}
-				}
-				else
-				{
-					// TODO: if all the keys in the block are the same and there are
-					//       no gaps/defaults then just use a range-check.
-					if (compare_type == TypeManager.int64_type ||
-						compare_type == TypeManager.uint64_type)
-					{
-						// TODO: optimize constant/I4 cases
+							ec.EmitLong (kb.min);
+							ec.Emit (OpCodes.Blt, lbl_default);
 
-						// check block range (could be > 2^31)
-						val.Emit (ec);
-						EmitObjectInteger (ig, System.Convert.ChangeType (kb.first, type_keys));
-						ig.Emit (OpCodes.Blt, lbl_default);
-						val.Emit (ec);
-						EmitObjectInteger (ig, System.Convert.ChangeType (kb.last, type_keys));
-						ig.Emit (OpCodes.Bgt, lbl_default);
+							val.Emit (ec);
+							ec.EmitLong (kb.max);
+							ec.Emit (OpCodes.Bgt, lbl_default);
 
-						// normalize range
-						val.Emit (ec);
-						if (kb.first != 0)
-						{
-							EmitObjectInteger (ig, System.Convert.ChangeType (kb.first, type_keys));
-							ig.Emit (OpCodes.Sub);
+							// normalize range
+							val.Emit (ec);
+							if (kb.min != 0) {
+								ec.EmitLong (kb.min);
+								ec.Emit (OpCodes.Sub);
+							}
+
+							ec.Emit (OpCodes.Conv_I4);	// assumes < 2^31 labels!
+						} else {
+							// normalize range
+							val.Emit (ec);
+							int first = (int) kb.min;
+							if (first > 0) {
+								ec.EmitInt (first);
+								ec.Emit (OpCodes.Sub);
+							} else if (first < 0) {
+								ec.EmitInt (-first);
+								ec.Emit (OpCodes.Add);
+							}
 						}
-						ig.Emit (OpCodes.Conv_I4);	// assumes < 2^31 labels!
-					}
-					else
-					{
-						// normalize range
-						val.Emit (ec);
-						int first = (int) kb.first;
-						if (first > 0)
-						{
-							IntConstant.EmitInt (ig, first);
-							ig.Emit (OpCodes.Sub);
+
+						// first, build the list of labels for the switch
+						int iKey = 0;
+						long cJumps = kb.Range;
+						Label[] switch_labels = new Label[cJumps];
+						for (int iJump = 0; iJump < cJumps; iJump++) {
+							var key = kb.label_values[iKey];
+							if (key == kb.min + iJump) {
+								switch_labels[iJump] = labels[key].GetILLabel (ec);
+								iKey++;
+							} else {
+								switch_labels[iJump] = lbl_default;
+							}
 						}
-						else if (first < 0)
-						{
-							IntConstant.EmitInt (ig, -first);
-							ig.Emit (OpCodes.Add);
-						}
+
+						// emit the switch opcode
+						ec.Emit (OpCodes.Switch, switch_labels);
 					}
 
-					// first, build the list of labels for the switch
-					int iKey = 0;
-					int cJumps = kb.Length;
-					Label [] switch_labels = new Label [cJumps];
-					for (int iJump = 0; iJump < cJumps; iJump++)
-					{
-						object key = kb.element_keys [iKey];
-						if (System.Convert.ToInt64 (key) == kb.first + iJump)
-						{
-							SwitchLabel sl = (SwitchLabel) Elements [key];
-							switch_labels [iJump] = sl.GetILLabel (ec);
-							iKey++;
-						}
-						else
-							switch_labels [iJump] = lbl_default;
-					}
-					// emit the switch opcode
-					ig.Emit (OpCodes.Switch, switch_labels);
+					// mark the default for this block
+					if (range_index != 0)
+						ec.MarkLabel (lbl_default);
 				}
 
-				// mark the default for this block
-				if (iBlock != 0)
-					ig.MarkLabel (lbl_default);
+				// the last default just goes to the end
+				if (ranges.Count > 0)
+					ec.Emit (OpCodes.Br, lbl_default);
+			}
+		}
+		
+		public SwitchLabel FindLabel (Constant value)
+		{
+			SwitchLabel sl = null;
+
+			if (string_labels != null) {
+				string s = value.GetValue () as string;
+				if (s == null) {
+					if (case_null != null)
+						sl = case_null;
+					else if (case_default != null)
+						sl = case_default;
+				} else {
+					string_labels.TryGetValue (s, out sl);
+				}
+			} else {
+				if (value is NullLiteral) {
+					sl = case_null;
+				} else {
+					labels.TryGetValue (value.GetValueAsLong (), out sl);
+				}
 			}
 
-			// TODO: find the default case and emit it here,
-			//       to prevent having to do the following jump.
-			//       make sure to mark other labels in the default section
+			if (sl == null || sl.SectionStart)
+				return sl;
 
-			// the last default just goes to the end
-			if (element_keys.Length > 0)
-				ig.Emit (OpCodes.Br, lbl_default);
-
-			// now emit the code for the sections
-			bool found_default = false;
-
-			foreach (SwitchSection ss in Sections) {
-				foreach (SwitchLabel sl in ss.Labels) {
-					if (sl.Converted == SwitchLabel.NullStringCase) {
-						ig.MarkLabel (null_target);
-					} else if (sl.Label == null) {
-						ig.MarkLabel (lbl_default);
-						found_default = true;
-						if (!has_null_case)
-							ig.MarkLabel (null_target);
-					}
-					ig.MarkLabel (sl.GetILLabel (ec));
-					ig.MarkLabel (sl.GetILLabelCode (ec));
-				}
-				ss.Block.Emit (ec);
+			//
+			// Always return section start, it simplifies handling of switch labels
+			//
+			for (int idx = case_labels.IndexOf (sl); ; --idx) {
+				var cs = case_labels [idx];
+				if (cs.SectionStart)
+					return cs;
 			}
-			
-			if (!found_default) {
-				ig.MarkLabel (lbl_default);
-				if (!has_null_case) {
-					ig.MarkLabel (null_target);
-				}
-			}
-			
-			ig.MarkLabel (lbl_end);
 		}
 
-		SwitchSection FindSection (SwitchLabel label)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			foreach (SwitchSection ss in Sections){
-				foreach (SwitchLabel sl in ss.Labels){
-					if (label == sl)
-						return ss;
-				}
+			Expr.FlowAnalysis (fc);
+
+			var prev_switch = fc.SwitchInitialDefinitiveAssignment;
+			var InitialDefinitiveAssignment = fc.DefiniteAssignment;
+			fc.SwitchInitialDefinitiveAssignment = InitialDefinitiveAssignment;
+
+			block.FlowAnalysis (fc);
+
+			fc.SwitchInitialDefinitiveAssignment = prev_switch;
+
+			if (end_reachable_das != null) {
+				var sections_das = DefiniteAssignmentBitSet.And (end_reachable_das);
+				InitialDefinitiveAssignment |= sections_das;
+				end_reachable_das = null;
 			}
 
-			return null;
-		}
+			fc.DefiniteAssignment = InitialDefinitiveAssignment;
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-		{
-			foreach (SwitchSection ss in Sections)
-				ss.Block.MutateHoistedGenericType (storey);
-		}
-
-		public static void Reset ()
-		{
-			unique_counter = 0;
-			allowed_types = null;
+			return case_default != null && !end_reachable;
 		}
 
 		public override bool Resolve (BlockContext ec)
@@ -3612,180 +5086,322 @@ namespace Mono.CSharp {
 			if (Expr == null)
 				return false;
 
-			new_expr = SwitchGoverningType (ec, Expr);
+			//
+			// LAMESPEC: User conversion from non-nullable governing type has a priority
+			//
+			new_expr = SwitchGoverningType (ec, Expr, false);
 
-			if ((new_expr == null) && TypeManager.IsNullableType (Expr.Type)) {
-				unwrap = Nullable.Unwrap.Create (Expr, false);
-				if (unwrap == null)
-					return false;
+			if (new_expr == null) {
+				if (Expr.Type.IsNullableType) {
+					unwrap = Nullable.Unwrap.Create (Expr, false);
+					if (unwrap == null)
+						return false;
 
-				new_expr = SwitchGoverningType (ec, unwrap);
-			}
-
-			if (new_expr == null){
-				ec.Report.Error (151, loc,
-					"A switch expression of type `{0}' cannot be converted to an integral type, bool, char, string, enum or nullable type",
-					TypeManager.CSharpName (Expr.Type));
-				return false;
-			}
-
-			// Validate switch.
-			SwitchType = new_expr.Type;
-
-			if (RootContext.Version == LanguageVersion.ISO_1 && SwitchType == TypeManager.bool_type) {
-				ec.Report.FeatureIsNotAvailable (loc, "switch expression of boolean type");
-				return false;
-			}
-
-			if (!CheckSwitch (ec))
-				return false;
-
-			if (HaveUnwrap)
-				Elements.Remove (SwitchLabel.NullStringCase);
-
-			Switch old_switch = ec.Switch;
-			ec.Switch = this;
-			ec.Switch.SwitchType = SwitchType;
-
-			Report.Debug (1, "START OF SWITCH BLOCK", loc, ec.CurrentBranching);
-			ec.StartFlowBranching (FlowBranching.BranchingType.Switch, loc);
-
-			is_constant = new_expr is Constant;
-			if (is_constant) {
-				object key = ((Constant) new_expr).GetValue ();
-				SwitchLabel label = (SwitchLabel) Elements [key];
-
-				constant_section = FindSection (label);
-				if (constant_section == null)
-					constant_section = default_section;
-			}
-
-			bool first = true;
-			bool ok = true;
-			foreach (SwitchSection ss in Sections){
-				if (!first)
-					ec.CurrentBranching.CreateSibling (
-						null, FlowBranching.SiblingType.SwitchSection);
-				else
-					first = false;
-
-				if (is_constant && (ss != constant_section)) {
-					// If we're a constant switch, we're only emitting
-					// one single section - mark all the others as
-					// unreachable.
-					ec.CurrentBranching.CurrentUsageVector.Goto ();
-					if (!ss.Block.ResolveUnreachable (ec, true)) {
-						ok = false;
-					}
-				} else {
-					if (!ss.Block.Resolve (ec))
-						ok = false;
+					//
+					// Unwrap + user conversion using non-nullable type is not allowed but user operator
+					// involving nullable Expr and nullable governing type is
+					//
+					new_expr = SwitchGoverningType (ec, unwrap, true);
 				}
 			}
 
-			if (default_section == null)
-				ec.CurrentBranching.CreateSibling (
-					null, FlowBranching.SiblingType.SwitchSection);
+			Expression switch_expr;
+			if (new_expr == null) {
+				if (ec.Module.Compiler.Settings.Version != LanguageVersion.Experimental) {
+					if (Expr.Type != InternalType.ErrorType) {
+						ec.Report.Error (151, loc,
+							"A switch expression of type `{0}' cannot be converted to an integral type, bool, char, string, enum or nullable type",
+							Expr.Type.GetSignatureForError ());
+					}
 
-			ec.EndFlowBranching ();
+					return false;
+				}
+
+				switch_expr = Expr;
+				SwitchType = Expr.Type;
+			} else {
+				switch_expr = new_expr;
+				SwitchType = new_expr.Type;
+				if (SwitchType.IsNullableType) {
+					new_expr = unwrap = Nullable.Unwrap.Create (new_expr, true);
+					SwitchType = Nullable.NullableInfo.GetUnderlyingType (SwitchType);
+				}
+
+				if (SwitchType.BuiltinType == BuiltinTypeSpec.Type.Bool && ec.Module.Compiler.Settings.Version == LanguageVersion.ISO_1) {
+					ec.Report.FeatureIsNotAvailable (ec.Module.Compiler, loc, "switch expression of boolean type");
+					return false;
+				}
+
+				if (block.Statements.Count == 0)
+					return true;
+
+				if (SwitchType.BuiltinType == BuiltinTypeSpec.Type.String) {
+					string_labels = new Dictionary<string, SwitchLabel> ();
+				} else {
+					labels = new Dictionary<long, SwitchLabel> ();
+				}
+			}
+
+			var constant = switch_expr as Constant;
+
+			//
+			// Don't need extra variable for constant switch or switch with
+			// only default case
+			//
+			if (constant == null) {
+				//
+				// Store switch expression for comparison purposes
+				//
+				value = switch_expr as VariableReference;
+				if (value == null && !HasOnlyDefaultSection ()) {
+					var current_block = ec.CurrentBlock;
+					ec.CurrentBlock = Block;
+					// Create temporary variable inside switch scope
+					value = TemporaryVariableReference.Create (SwitchType, ec.CurrentBlock, loc);
+					value.Resolve (ec);
+					ec.CurrentBlock = current_block;
+				}
+			}
+
+			case_labels = new List<SwitchLabel> ();
+
+			Switch old_switch = ec.Switch;
+			ec.Switch = this;
+			var parent_los = ec.EnclosingLoopOrSwitch;
+			ec.EnclosingLoopOrSwitch = this;
+
+			var ok = Statement.Resolve (ec);
+
+			ec.EnclosingLoopOrSwitch = parent_los;
 			ec.Switch = old_switch;
 
-			Report.Debug (1, "END OF SWITCH BLOCK", loc, ec.CurrentBranching);
+			//
+			// Check if all goto cases are valid. Needs to be done after switch
+			// is resolved because goto can jump forward in the scope.
+			//
+			if (goto_cases != null) {
+				foreach (var gc in goto_cases) {
+					if (gc.Item1 == null) {
+						if (DefaultLabel == null) {
+							Goto.Error_UnknownLabel (ec, "default", loc);
+						}
+
+						continue;
+					}
+
+					var sl = FindLabel (gc.Item2);
+					if (sl == null) {
+						Goto.Error_UnknownLabel (ec, "case " + gc.Item2.GetValueAsLiteral (), loc);
+					} else {
+						gc.Item1.Label = sl;
+					}
+				}
+			}
 
 			if (!ok)
 				return false;
 
-			if (SwitchType == TypeManager.string_type && !is_constant) {
-				// TODO: Optimize single case, and single+default case
+			if (constant == null && SwitchType.BuiltinType == BuiltinTypeSpec.Type.String && string_labels.Count > 6) {
 				ResolveStringSwitchMap (ec);
+			}
+
+			//
+			// Anonymous storey initialization has to happen before
+			// any generated switch dispatch
+			//
+			block.InsertStatement (0, new DispatchStatement (this));
+
+			return true;
+		}
+
+		bool HasOnlyDefaultSection ()
+		{
+			for (int i = 0; i < block.Statements.Count; ++i) {
+				var s = block.Statements[i] as SwitchLabel;
+
+				if (s == null || s.IsDefault)
+					continue;
+
+				return false;
 			}
 
 			return true;
 		}
 
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (rc.IsUnreachable)
+				return rc;
+
+			base.MarkReachable (rc);
+
+			block.MarkReachableScope (rc);
+
+			if (block.Statements.Count == 0)
+				return rc;
+
+			SwitchLabel constant_label = null;
+			var constant = new_expr as Constant;
+
+			if (constant != null) {
+				constant_label = FindLabel (constant) ?? case_default;
+				if (constant_label == null) {
+					block.Statements.RemoveAt (0);
+					return rc;
+				}
+			}
+
+			var section_rc = new Reachability ();
+			SwitchLabel prev_label = null;
+
+			for (int i = 0; i < block.Statements.Count; ++i) {
+				var s = block.Statements[i];
+				var sl = s as SwitchLabel;
+
+				if (sl != null && sl.SectionStart) {
+					//
+					// Section is marked already via goto case
+					//
+					if (!sl.IsUnreachable) {
+						section_rc = new Reachability ();
+						continue;
+					}
+
+					if (constant_label != null && constant_label != sl)
+						section_rc = Reachability.CreateUnreachable ();
+					else if (section_rc.IsUnreachable) {
+						section_rc = new Reachability ();
+					} else {
+						if (prev_label != null) {
+							sl.SectionStart = false;
+							s = new MissingBreak (prev_label);
+							s.MarkReachable (rc);
+							block.Statements.Insert (i - 1, s);
+							++i;
+						}
+					}
+
+					prev_label = sl;
+				}
+
+				section_rc = s.MarkReachable (section_rc);
+			}
+
+			if (!section_rc.IsUnreachable && prev_label != null) {
+				prev_label.SectionStart = false;
+				var s = new MissingBreak (prev_label) {
+					FallOut = true
+				};
+
+				s.MarkReachable (rc);
+				block.Statements.Add (s);
+			}
+
+			//
+			// Reachability can affect parent only when all possible paths are handled but
+			// we still need to run reachability check on switch body to check for fall-through
+			//
+			if (case_default == null && constant_label == null)
+				return rc;
+
+			//
+			// We have at least one local exit from the switch
+			//
+			if (end_reachable)
+				return rc;
+
+			return Reachability.CreateUnreachable ();
+		}
+
+		public void RegisterGotoCase (GotoCase gotoCase, Constant value)
+		{
+			if (goto_cases == null)
+				goto_cases = new List<Tuple<GotoCase, Constant>> ();
+
+			goto_cases.Add (Tuple.Create (gotoCase, value));
+		}
+
+		//
+		// Converts string switch into string hashtable
+		//
 		void ResolveStringSwitchMap (ResolveContext ec)
 		{
 			FullNamedExpression string_dictionary_type;
-			if (TypeManager.generic_ienumerable_type != null) {
-				MemberAccess system_collections_generic = new MemberAccess (new MemberAccess (
-					new QualifiedAliasMember (QualifiedAliasMember.GlobalAlias, "System", loc), "Collections", loc), "Generic", loc);
-
-				string_dictionary_type = new MemberAccess (system_collections_generic, "Dictionary",
-					new TypeArguments (
-						new TypeExpression (TypeManager.string_type, loc),
-						new TypeExpression (TypeManager.int32_type, loc)), loc);
+			if (ec.Module.PredefinedTypes.Dictionary.Define ()) {
+				string_dictionary_type = new TypeExpression (
+					ec.Module.PredefinedTypes.Dictionary.TypeSpec.MakeGenericType (ec,
+						new [] { ec.BuiltinTypes.String, ec.BuiltinTypes.Int }),
+					loc);
+			} else if (ec.Module.PredefinedTypes.Hashtable.Define ()) {
+				string_dictionary_type = new TypeExpression (ec.Module.PredefinedTypes.Hashtable.TypeSpec, loc);
 			} else {
-				MemberAccess system_collections_generic = new MemberAccess (
-					new QualifiedAliasMember (QualifiedAliasMember.GlobalAlias, "System", loc), "Collections", loc);
-
-				string_dictionary_type = new MemberAccess (system_collections_generic, "Hashtable", loc);
+				ec.Module.PredefinedTypes.Dictionary.Resolve ();
+				return;
 			}
 
-			Field field = new Field (ec.CurrentTypeDefinition, string_dictionary_type,
+			var ctype = ec.CurrentMemberDefinition.Parent.PartialContainer;
+			Field field = new Field (ctype, string_dictionary_type,
 				Modifiers.STATIC | Modifiers.PRIVATE | Modifiers.COMPILER_GENERATED,
-				new MemberName (CompilerGeneratedClass.MakeName (null, "f", "switch$map", unique_counter++), loc), null);
+				new MemberName (CompilerGeneratedContainer.MakeName (null, "f", "switch$map", ec.Module.CounterSwitchTypes++), loc), null);
 			if (!field.Define ())
 				return;
-			ec.CurrentTypeDefinition.PartialContainer.AddField (field);
+			ctype.AddField (field);
 
-			ArrayList init = new ArrayList ();
-			int counter = 0;
-			Elements.Clear ();
+			var init = new List<Expression> ();
+			int counter = -1;
+			labels = new Dictionary<long, SwitchLabel> (string_labels.Count);
 			string value = null;
-			foreach (SwitchSection section in Sections) {
-				int last_count = init.Count;
-				foreach (SwitchLabel sl in section.Labels) {
-					if (sl.Label == null || sl.Converted == SwitchLabel.NullStringCase)
-						continue;
 
-					value = (string) sl.Converted;
-					ArrayList init_args = new ArrayList (2);
-					init_args.Add (new StringLiteral (value, sl.Location));
-					init_args.Add (new IntConstant (counter, loc));
-					init.Add (new CollectionElementInitializer (init_args, loc));
-				}
+			foreach (SwitchLabel sl in case_labels) {
 
-				//
-				// Don't add empty sections
-				//
-				if (last_count == init.Count)
+				if (sl.SectionStart)
+					labels.Add (++counter, sl);
+
+				if (sl == case_default || sl == case_null)
 					continue;
 
-				Elements.Add (counter, section.Labels [0]);
-				++counter;
-			}
+				value = (string) sl.Converted.GetValue ();
+				var init_args = new List<Expression> (2);
+				init_args.Add (new StringLiteral (ec.BuiltinTypes, value, sl.Location));
 
+				sl.Converted = new IntConstant (ec.BuiltinTypes, counter, loc);
+				init_args.Add (sl.Converted);
+
+				init.Add (new CollectionElementInitializer (init_args, loc));
+			}
+	
 			Arguments args = new Arguments (1);
-			args.Add (new Argument (new IntConstant (init.Count, loc)));
+			args.Add (new Argument (new IntConstant (ec.BuiltinTypes, init.Count, loc)));
 			Expression initializer = new NewInitialize (string_dictionary_type, args,
 				new CollectionOrObjectInitializers (init, loc), loc);
 
-			switch_cache_field = new FieldExpr (field.FieldBuilder, loc);
+			switch_cache_field = new FieldExpr (field, loc);
 			string_dictionary = new SimpleAssign (switch_cache_field, initializer.Resolve (ec));
 		}
 
-		void DoEmitStringSwitch (LocalTemporary value, EmitContext ec)
+		void DoEmitStringSwitch (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-			Label l_initialized = ig.DefineLabel ();
+			Label l_initialized = ec.DefineLabel ();
 
 			//
 			// Skip initialization when value is null
 			//
-			value.EmitBranchable (ec, null_target, false);
+			value.EmitBranchable (ec, nullLabel, false);
 
 			//
 			// Check if string dictionary is initialized and initialize
 			//
 			switch_cache_field.EmitBranchable (ec, l_initialized, true);
-			string_dictionary.EmitStatement (ec);
-			ig.MarkLabel (l_initialized);
+			using (ec.With (BuilderContext.Options.OmitDebugInfo, true)) {
+				string_dictionary.EmitStatement (ec);
+			}
+			ec.MarkLabel (l_initialized);
 
-			LocalTemporary string_switch_variable = new LocalTemporary (TypeManager.int32_type);
+			LocalTemporary string_switch_variable = new LocalTemporary (ec.BuiltinTypes.Int);
 
 			ResolveContext rc = new ResolveContext (ec.MemberContext);
 
-			if (TypeManager.generic_ienumerable_type != null) {
+			if (switch_cache_field.Type.IsGeneric) {
 				Arguments get_value_args = new Arguments (2);
 				get_value_args.Add (new Argument (value));
 				get_value_args.Add (new Argument (string_switch_variable, Argument.AType.Out));
@@ -3796,77 +5412,158 @@ namespace Mono.CSharp {
 				//
 				// A value was not found, go to default case
 				//
-				get_item.EmitBranchable (ec, default_target, false);
+				get_item.EmitBranchable (ec, defaultLabel, false);
 			} else {
 				Arguments get_value_args = new Arguments (1);
 				get_value_args.Add (new Argument (value));
 
-				Expression get_item = new IndexerAccess (new ElementAccess (switch_cache_field, get_value_args), loc).Resolve (rc);
+				Expression get_item = new ElementAccess (switch_cache_field, get_value_args, loc).Resolve (rc);
 				if (get_item == null)
 					return;
 
-				LocalTemporary get_item_object = new LocalTemporary (TypeManager.object_type);
+				LocalTemporary get_item_object = new LocalTemporary (ec.BuiltinTypes.Object);
 				get_item_object.EmitAssign (ec, get_item, true, false);
-				ec.ig.Emit (OpCodes.Brfalse, default_target);
+				ec.Emit (OpCodes.Brfalse, defaultLabel);
 
 				ExpressionStatement get_item_int = (ExpressionStatement) new SimpleAssign (string_switch_variable,
-					new Cast (new TypeExpression (TypeManager.int32_type, loc), get_item_object, loc)).Resolve (rc);
+					new Cast (new TypeExpression (ec.BuiltinTypes.Int, loc), get_item_object, loc)).Resolve (rc);
 
 				get_item_int.EmitStatement (ec);
 				get_item_object.Release (ec);
 			}
 
-			TableSwitchEmit (ec, string_switch_variable);
+			EmitTableSwitch (ec, string_switch_variable);
 			string_switch_variable.Release (ec);
 		}
-		
+
+		//
+		// Emits switch using simple if/else comparison for small label count (4 + optional default)
+		//
+		void EmitShortSwitch (EmitContext ec)
+		{
+			MethodSpec equal_method = null;
+			if (SwitchType.BuiltinType == BuiltinTypeSpec.Type.String) {
+				equal_method = ec.Module.PredefinedMembers.StringEqual.Resolve (loc);
+			}
+
+			if (equal_method != null) {
+				value.EmitBranchable (ec, nullLabel, false);
+			}
+
+			for (int i = 0; i < case_labels.Count; ++i) {
+				var label = case_labels [i];
+				if (label == case_default || label == case_null)
+					continue;
+
+				var constant = label.Converted;
+
+				if (constant == null) {
+					label.Label.EmitBranchable (ec, label.GetILLabel (ec), true);
+					continue;
+				}
+
+				if (equal_method != null) {
+					value.Emit (ec);
+					constant.Emit (ec);
+
+					var call = new CallEmitter ();
+					call.EmitPredefined (ec, equal_method, new Arguments (0));
+					ec.Emit (OpCodes.Brtrue, label.GetILLabel (ec));
+					continue;
+				}
+
+				if (constant.IsZeroInteger && constant.Type.BuiltinType != BuiltinTypeSpec.Type.Long && constant.Type.BuiltinType != BuiltinTypeSpec.Type.ULong) {
+					value.EmitBranchable (ec, label.GetILLabel (ec), false);
+					continue;
+				}
+
+				value.Emit (ec);
+				constant.Emit (ec);
+				ec.Emit (OpCodes.Beq, label.GetILLabel (ec));
+			}
+
+			ec.Emit (OpCodes.Br, defaultLabel);
+		}
+
+		void EmitDispatch (EmitContext ec)
+		{
+			if (IsPatternMatching) {
+				EmitShortSwitch (ec);
+				return;
+			}
+
+			if (value == null) {
+				//
+				// Constant switch, we've already done the work if there is only 1 label
+				// referenced
+				//
+				int reachable = 0;
+				foreach (var sl in case_labels) {
+					if (sl.IsUnreachable)
+						continue;
+
+					if (reachable++ > 0) {
+						var constant = (Constant) new_expr;
+						var constant_label = FindLabel (constant) ?? case_default;
+
+						ec.Emit (OpCodes.Br, constant_label.GetILLabel (ec));
+						break;
+					}
+				}
+
+				return;
+			}
+
+			if (string_dictionary != null) {
+				DoEmitStringSwitch (ec);
+			} else if (case_labels.Count < 4 || string_labels != null) {
+				EmitShortSwitch (ec);
+			} else {
+				EmitTableSwitch (ec, value);
+			}
+		}
+
 		protected override void DoEmit (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-
-			default_target = ig.DefineLabel ();
-			null_target = ig.DefineLabel ();
-
-			// Store variable for comparission purposes
-			// TODO: Don't duplicate non-captured VariableReference
-			LocalTemporary value;
-			if (HaveUnwrap) {
-				value = new LocalTemporary (SwitchType);
-				unwrap.EmitCheck (ec);
-				ig.Emit (OpCodes.Brfalse, null_target);
-				new_expr.Emit (ec);
-				value.Store (ec);
-			} else if (!is_constant) {
-				value = new LocalTemporary (SwitchType);
-				new_expr.Emit (ec);
-				value.Store (ec);
-			} else
-				value = null;
-
 			//
 			// Setup the codegen context
 			//
 			Label old_end = ec.LoopEnd;
 			Switch old_switch = ec.Switch;
-			
-			ec.LoopEnd = ig.DefineLabel ();
+
+			ec.LoopEnd = ec.DefineLabel ();
 			ec.Switch = this;
 
-			// Emit Code.
-			if (is_constant) {
-				if (constant_section != null)
-					constant_section.Block.Emit (ec);
-			} else if (string_dictionary != null) {
-				DoEmitStringSwitch (value, ec);
+			defaultLabel = case_default == null ? ec.LoopEnd : case_default.GetILLabel (ec);
+			nullLabel = case_null == null ? defaultLabel : case_null.GetILLabel (ec);
+
+			if (value != null) {
+				ec.Mark (loc);
+
+				var switch_expr = new_expr ?? Expr;
+				if (IsNullable) {
+					unwrap.EmitCheck (ec);
+					ec.Emit (OpCodes.Brfalse, nullLabel);
+					value.EmitAssign (ec, switch_expr, false, false);
+				} else if (switch_expr != value) {
+					value.EmitAssign (ec, switch_expr, false, false);
+				}
+
+
+				//
+				// Next statement is compiler generated we don't need extra
+				// nop when we can use the statement for sequence point
+				//
+				ec.Mark (block.StartLocation);
+				block.IsCompilerGenerated = true;
 			} else {
-				TableSwitchEmit (ec, value);
+				new_expr.EmitSideEffect (ec);
 			}
 
-			if (value != null)
-				value.Release (ec);
+			block.Emit (ec);
 
 			// Restore context state. 
-			ig.MarkLabel (ec.LoopEnd);
+			ec.MarkLabel (ec.LoopEnd);
 
 			//
 			// Restore the previous context
@@ -3880,14 +5577,32 @@ namespace Mono.CSharp {
 			Switch target = (Switch) t;
 
 			target.Expr = Expr.Clone (clonectx);
-			target.Sections = new ArrayList ();
-			foreach (SwitchSection ss in Sections){
-				target.Sections.Add (ss.Clone (clonectx));
-			}
+			target.Statement = target.block = (ExplicitBlock) block.Clone (clonectx);
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+
+		public override void AddEndDefiniteAssignment (FlowAnalysisContext fc)
+		{
+			if (case_default == null && !(new_expr is Constant))
+				return;
+
+			if (end_reachable_das == null)
+				end_reachable_das = new List<DefiniteAssignmentBitSet> ();
+
+			end_reachable_das.Add (fc.DefiniteAssignment);
+		}
+
+		public override void SetEndReachable ()
+		{
+			end_reachable = true;
 		}
 	}
 
-	// A place where execution can restart in an iterator
+	// A place where execution can restart in a state machine
 	public abstract class ResumableStatement : Statement
 	{
 		bool prepared;
@@ -3897,7 +5612,7 @@ namespace Mono.CSharp {
 		{
 			if (!prepared) {
 				prepared = true;
-				resume_point = ec.ig.DefineLabel ();
+				resume_point = ec.DefineLabel ();
 			}
 			return resume_point;
 		}
@@ -3906,110 +5621,253 @@ namespace Mono.CSharp {
 		{
 			return end;
 		}
-		public virtual void EmitForDispose (EmitContext ec, Iterator iterator, Label end, bool have_dispatcher)
+
+		public virtual void EmitForDispose (EmitContext ec, LocalBuilder pc, Label end, bool have_dispatcher)
 		{
 		}
 	}
 
-	// Base class for statements that are implemented in terms of try...finally
-	public abstract class ExceptionStatement : ResumableStatement
+	public abstract class TryFinallyBlock : ExceptionStatement
 	{
-		bool code_follows;
-		Iterator iter;
+		protected Statement stmt;
+		Label dispose_try_block;
+		bool prepared_for_dispose, emitted_dispose;
 		Method finally_host;
 
-		protected abstract void EmitPreTryBody (EmitContext ec);
+		protected TryFinallyBlock (Statement stmt, Location loc)
+			: base (loc)
+		{
+			this.stmt = stmt;
+		}
+
+		#region Properties
+
+		public Statement Statement {
+			get {
+				return stmt;
+			}
+		}
+
+		#endregion
+
 		protected abstract void EmitTryBody (EmitContext ec);
 		public abstract void EmitFinallyBody (EmitContext ec);
 
+		public override Label PrepareForDispose (EmitContext ec, Label end)
+		{
+			if (!prepared_for_dispose) {
+				prepared_for_dispose = true;
+				dispose_try_block = ec.DefineLabel ();
+			}
+			return dispose_try_block;
+		}
+
 		protected sealed override void DoEmit (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-
-			EmitPreTryBody (ec);
-
-			if (resume_points != null) {
-				IntConstant.EmitInt (ig, (int) Iterator.State.Running);
-				ig.Emit (OpCodes.Stloc, iter.CurrentPC);
-			}
-
-			ig.BeginExceptionBlock ();
-
-			if (resume_points != null) {
-				ig.MarkLabel (resume_point);
-
-				// For normal control flow, we want to fall-through the Switch
-				// So, we use CurrentPC rather than the $PC field, and initialize it to an outside value above
-				ig.Emit (OpCodes.Ldloc, iter.CurrentPC);
-				IntConstant.EmitInt (ig, first_resume_pc);
-				ig.Emit (OpCodes.Sub);
-
-				Label [] labels = new Label [resume_points.Count];
-				for (int i = 0; i < resume_points.Count; ++i)
-					labels [i] = ((ResumableStatement) resume_points [i]).PrepareForEmit (ec);
-				ig.Emit (OpCodes.Switch, labels);
-			}
-
+			EmitTryBodyPrepare (ec);
 			EmitTryBody (ec);
 
-			ig.BeginFinallyBlock ();
+			bool beginFinally = EmitBeginFinallyBlock (ec);
 
-			Label start_finally = ec.ig.DefineLabel ();
-			if (resume_points != null) {
-				ig.Emit (OpCodes.Ldloc, iter.SkipFinally);
-				ig.Emit (OpCodes.Brfalse_S, start_finally);
-				ig.Emit (OpCodes.Endfinally);
+			Label start_finally = ec.DefineLabel ();
+			if (resume_points != null && beginFinally) {
+				var state_machine = (StateMachineInitializer) ec.CurrentAnonymousMethod;
+
+				ec.Emit (OpCodes.Ldloc, state_machine.SkipFinally);
+				ec.Emit (OpCodes.Brfalse_S, start_finally);
+				ec.Emit (OpCodes.Endfinally);
 			}
 
-			ig.MarkLabel (start_finally);
-			
-			if (finally_host != null) 
-			{
-				finally_host.Define();
-				finally_host.Emit();
-				
-				IteratorStorey parent = (IteratorStorey)finally_host.Parent;
-				parent.AddMember (finally_host);
-				
-				Invocation.EmitCall (ec, true, new CompilerGeneratedThis (ec.CurrentType, loc), finally_host.MethodBuilder, new Arguments (0), loc);
-			} 
-			else
+			ec.MarkLabel (start_finally);
+
+			if (finally_host != null) {
+				finally_host.Define ();
+				finally_host.PrepareEmit ();
+				finally_host.Emit ();
+
+				// Now it's safe to add, to close it properly and emit sequence points
+				finally_host.Parent.AddMember (finally_host);
+
+				var ce = new CallEmitter ();
+				ce.InstanceExpression = new CompilerGeneratedThis (ec.CurrentType, loc);
+				ce.EmitPredefined (ec, finally_host.Spec, new Arguments (0), true);
+			} else {
 				EmitFinallyBody (ec);
-
-			ig.EndExceptionBlock ();
-		}
-
-		public void SomeCodeFollows ()
-		{
-			code_follows = true;
-		}
-
-		public override bool Resolve (BlockContext ec)
-		{
-			// System.Reflection.Emit automatically emits a 'leave' at the end of a try clause
-			// So, ensure there's some IL code after this statement.
-			if (!code_follows && resume_points == null && ec.CurrentBranching.CurrentUsageVector.IsUnreachable)
-				ec.NeedReturnLabel ();
-
-			iter = ec.CurrentIterator;
-			
-			if (iter != null && !ec.IsInProbingMode)
-			{		
-				TryFinally tryFinally = this as TryFinally;
-				
-				if(tryFinally != null)			
-					finally_host = iter.CreateFinallyHost (this);
 			}
-			
+
+			if (beginFinally)
+				ec.EndExceptionBlock ();
+		}
+
+		public override void EmitForDispose (EmitContext ec, LocalBuilder pc, Label end, bool have_dispatcher)
+		{
+			if (emitted_dispose)
+				return;
+
+			emitted_dispose = true;
+
+			Label end_of_try = ec.DefineLabel ();
+
+			// Ensure that the only way we can get into this code is through a dispatcher
+			if (have_dispatcher)
+				ec.Emit (OpCodes.Br, end);
+
+			ec.BeginExceptionBlock ();
+
+			ec.MarkLabel (dispose_try_block);
+
+			Label[] labels = null;
+			for (int i = 0; i < resume_points.Count; ++i) {
+				ResumableStatement s = resume_points[i];
+				Label ret = s.PrepareForDispose (ec, end_of_try);
+				if (ret.Equals (end_of_try) && labels == null)
+					continue;
+				if (labels == null) {
+					labels = new Label[resume_points.Count];
+					for (int j = 0; j < i; ++j)
+						labels[j] = end_of_try;
+				}
+				labels[i] = ret;
+			}
+
+			if (labels != null) {
+				int j;
+				for (j = 1; j < labels.Length; ++j)
+					if (!labels[0].Equals (labels[j]))
+						break;
+				bool emit_dispatcher = j < labels.Length;
+
+				if (emit_dispatcher) {
+					ec.Emit (OpCodes.Ldloc, pc);
+					ec.EmitInt (first_resume_pc);
+					ec.Emit (OpCodes.Sub);
+					ec.Emit (OpCodes.Switch, labels);
+				}
+
+				foreach (ResumableStatement s in resume_points)
+					s.EmitForDispose (ec, pc, end_of_try, emit_dispatcher);
+			}
+
+			ec.MarkLabel (end_of_try);
+
+			ec.BeginFinallyBlock ();
+
+			if (finally_host != null) {
+				var ce = new CallEmitter ();
+				ce.InstanceExpression = new CompilerGeneratedThis (ec.CurrentType, loc);
+				ce.EmitPredefined (ec, finally_host.Spec, new Arguments (0), true);
+			} else {
+				EmitFinallyBody (ec);
+			}
+
+			ec.EndExceptionBlock ();
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			var res = stmt.FlowAnalysis (fc);
+			parent = null;
+			return res;
+		}
+
+		protected virtual bool EmitBeginFinallyBlock (EmitContext ec)
+		{
+			ec.BeginFinallyBlock ();
 			return true;
 		}
 
-		ArrayList resume_points;
-		int first_resume_pc;
-		public void AddResumePoint (ResumableStatement stmt, int pc)
+		public override Reachability MarkReachable (Reachability rc)
 		{
+			base.MarkReachable (rc);
+			return Statement.MarkReachable (rc);
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			bool ok;
+
+			parent = bc.CurrentTryBlock;
+			bc.CurrentTryBlock = this;
+
+			using (bc.Set (ResolveContext.Options.TryScope)) {
+				ok = stmt.Resolve (bc);
+			}
+
+			bc.CurrentTryBlock = parent;
+
+			//
+			// Finally block inside iterator is called from MoveNext and
+			// Dispose methods that means we need to lift the block into
+			// newly created host method to emit the body only once. The
+			// original block then simply calls the newly generated method.
+			//
+			if (bc.CurrentIterator != null && !bc.IsInProbingMode) {
+				var b = stmt as Block;
+				if (b != null && b.Explicit.HasYield) {
+					finally_host = bc.CurrentIterator.CreateFinallyHost (this);
+				}
+			}
+
+			return base.Resolve (bc) && ok;
+		}
+	}
+
+	//
+	// Base class for blocks using exception handling
+	//
+	public abstract class ExceptionStatement : ResumableStatement
+	{
+		protected List<ResumableStatement> resume_points;
+		protected int first_resume_pc;
+		protected ExceptionStatement parent;
+
+		protected ExceptionStatement (Location loc)
+		{
+			this.loc = loc;
+		}
+
+		protected virtual void EmitTryBodyPrepare (EmitContext ec)
+		{
+			StateMachineInitializer state_machine = null;
+			if (resume_points != null) {
+				state_machine = (StateMachineInitializer) ec.CurrentAnonymousMethod;
+
+				ec.EmitInt ((int) IteratorStorey.State.Running);
+				ec.Emit (OpCodes.Stloc, state_machine.CurrentPC);
+			}
+
+			ec.BeginExceptionBlock ();
+
+			if (resume_points != null) {
+				ec.MarkLabel (resume_point);
+
+				// For normal control flow, we want to fall-through the Switch
+				// So, we use CurrentPC rather than the $PC field, and initialize it to an outside value above
+				ec.Emit (OpCodes.Ldloc, state_machine.CurrentPC);
+				ec.EmitInt (first_resume_pc);
+				ec.Emit (OpCodes.Sub);
+
+				Label[] labels = new Label[resume_points.Count];
+				for (int i = 0; i < resume_points.Count; ++i)
+					labels[i] = resume_points[i].PrepareForEmit (ec);
+				ec.Emit (OpCodes.Switch, labels);
+			}
+		}
+
+		public virtual int AddResumePoint (ResumableStatement stmt, int pc, StateMachineInitializer stateMachine)
+		{
+			if (parent != null) {
+				// TODO: MOVE to virtual TryCatch
+				var tc = this as TryCatch;
+				var s = tc != null && tc.IsTryCatchFinally ? stmt : this;
+
+				pc = parent.AddResumePoint (s, pc, stateMachine);
+			} else {
+				pc = stateMachine.AddResumePoint (this);
+			}
+
 			if (resume_points == null) {
-				resume_points = new ArrayList ();
+				resume_points = new List<ResumableStatement> ();
 				first_resume_pc = pc;
 			}
 
@@ -4017,95 +5875,32 @@ namespace Mono.CSharp {
 				throw new InternalErrorException ("missed an intervening AddResumePoint?");
 
 			resume_points.Add (stmt);
-		}
-
-		Label dispose_try_block;
-		bool prepared_for_dispose, emitted_dispose;
-		public override Label PrepareForDispose (EmitContext ec, Label end)
-		{
-			if (!prepared_for_dispose) {
-				prepared_for_dispose = true;
-				dispose_try_block = ec.ig.DefineLabel ();
-			}
-			return dispose_try_block;
-		}
-
-		public override void EmitForDispose (EmitContext ec, Iterator iterator, Label end, bool have_dispatcher)
-		{
-			if (emitted_dispose)
-				return;
-
-			emitted_dispose = true;
-
-			ILGenerator ig = ec.ig;
-
-			Label end_of_try = ig.DefineLabel ();
-
-			// Ensure that the only way we can get into this code is through a dispatcher
-			if (have_dispatcher)
-				ig.Emit (OpCodes.Br, end);
-
-			ig.BeginExceptionBlock ();
-
-			ig.MarkLabel (dispose_try_block);
-
-			Label [] labels = null;
-			for (int i = 0; i < resume_points.Count; ++i) {
-				ResumableStatement s = (ResumableStatement) resume_points [i];
-				Label ret = s.PrepareForDispose (ec, end_of_try);
-				if (ret.Equals (end_of_try) && labels == null)
-					continue;
-				if (labels == null) {
-					labels = new Label [resume_points.Count];
-					for (int j = 0; j < i; ++j)
-						labels [j] = end_of_try;
-				}
-				labels [i] = ret;
-			}
-
-			if (labels != null) {
-				int j;
-				for (j = 1; j < labels.Length; ++j)
-					if (!labels [0].Equals (labels [j]))
-						break;
-				bool emit_dispatcher = j < labels.Length;
-
-				if (emit_dispatcher) {
-					//SymbolWriter.StartIteratorDispatcher (ec.ig);
-					ig.Emit (OpCodes.Ldloc, iterator.CurrentPC);
-					IntConstant.EmitInt (ig, first_resume_pc);
-					ig.Emit (OpCodes.Sub);
-					ig.Emit (OpCodes.Switch, labels);
-					//SymbolWriter.EndIteratorDispatcher (ec.ig);
-				}
-
-				foreach (ResumableStatement s in resume_points)
-					s.EmitForDispose (ec, iterator, end_of_try, emit_dispatcher);
-			}
-
-			ig.MarkLabel (end_of_try);
-
-			ig.BeginFinallyBlock ();
-
-			if (finally_host != null)
-				Invocation.EmitCall (ec, true, new CompilerGeneratedThis (ec.CurrentType, loc), finally_host.MethodBuilder, new Arguments (0), loc);
-			else
-				EmitFinallyBody (ec);
-
-			ig.EndExceptionBlock ();
+			return pc;
 		}
 	}
 
-	public class Lock : ExceptionStatement {
+	public class Lock : TryFinallyBlock
+	{
 		Expression expr;
-		public Statement Statement;
-		TemporaryVariable temp;
+		TemporaryVariableReference expr_copy;
+		TemporaryVariableReference lock_taken;
 			
-		public Lock (Expression expr, Statement stmt, Location l)
+		public Lock (Expression expr, Statement stmt, Location loc)
+			: base (stmt, loc)
 		{
 			this.expr = expr;
-			Statement = stmt;
-			loc = l;
+		}
+
+		public Expression Expr {
+			get {
+ 				return this.expr;
+			}
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			expr.FlowAnalysis (fc);
+			return base.DoFlowAnalysis (fc);
 		}
 
 		public override bool Resolve (BlockContext ec)
@@ -4114,82 +5909,145 @@ namespace Mono.CSharp {
 			if (expr == null)
 				return false;
 
-			if (!TypeManager.IsReferenceType (expr.Type)){
+			if (!TypeSpec.IsReferenceType (expr.Type)) {
 				ec.Report.Error (185, loc,
-					      "`{0}' is not a reference type as required by the lock statement",
-					      TypeManager.CSharpName (expr.Type));
-				return false;
+					"`{0}' is not a reference type as required by the lock statement",
+					expr.Type.GetSignatureForError ());
 			}
 
-			ec.StartFlowBranching (this);
-			bool ok = Statement.Resolve (ec);
-			ec.EndFlowBranching ();
-
-			ok &= base.Resolve (ec);
-
-			// Avoid creating libraries that reference the internal
-			// mcs NullType:
-			Type t = expr.Type;
-			if (t == TypeManager.null_type)
-				t = TypeManager.object_type;
-			
-			temp = new TemporaryVariable (t, loc);
-			temp.Resolve (ec);
-
-			if (TypeManager.void_monitor_enter_object == null || TypeManager.void_monitor_exit_object == null) {
-				Type monitor_type = TypeManager.CoreLookupType (ec.Compiler, "System.Threading", "Monitor", Kind.Class, true);
-				TypeManager.void_monitor_enter_object = TypeManager.GetPredefinedMethod (
-					monitor_type, "Enter", loc, TypeManager.object_type);
-				TypeManager.void_monitor_exit_object = TypeManager.GetPredefinedMethod (
-					monitor_type, "Exit", loc, TypeManager.object_type);
+			if (expr.Type.IsGenericParameter) {
+				expr = Convert.ImplicitTypeParameterConversion (expr, (TypeParameterSpec)expr.Type, ec.BuiltinTypes.Object);
 			}
-			
-			return ok;
+
+			VariableReference lv = expr as VariableReference;
+			bool locked;
+			if (lv != null) {
+				locked = lv.IsLockedByStatement;
+				lv.IsLockedByStatement = true;
+			} else {
+				lv = null;
+				locked = false;
+			}
+
+			//
+			// Have to keep original lock value around to unlock same location
+			// in the case of original value has changed or is null
+			//
+			expr_copy = TemporaryVariableReference.Create (ec.BuiltinTypes.Object, ec.CurrentBlock, loc);
+			expr_copy.Resolve (ec);
+
+			//
+			// Ensure Monitor methods are available
+			//
+			if (ResolvePredefinedMethods (ec) > 1) {
+				lock_taken = TemporaryVariableReference.Create (ec.BuiltinTypes.Bool, ec.CurrentBlock, loc);
+				lock_taken.Resolve (ec);
+			}
+
+			using (ec.Set (ResolveContext.Options.LockScope)) {
+				base.Resolve (ec);
+			}
+
+			if (lv != null) {
+				lv.IsLockedByStatement = locked;
+			}
+
+			return true;
 		}
 		
-		protected override void EmitPreTryBody (EmitContext ec)
+		protected override void EmitTryBodyPrepare (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
+			expr_copy.EmitAssign (ec, expr);
 
-			temp.EmitAssign (ec, expr);
-			temp.Emit (ec);
-			ig.Emit (OpCodes.Call, TypeManager.void_monitor_enter_object);
+			if (lock_taken != null) {
+				//
+				// Initialize ref variable
+				//
+				lock_taken.EmitAssign (ec, new BoolLiteral (ec.BuiltinTypes, false, loc));
+			} else {
+				//
+				// Monitor.Enter (expr_copy)
+				//
+				expr_copy.Emit (ec);
+				ec.Emit (OpCodes.Call, ec.Module.PredefinedMembers.MonitorEnter.Get ());
+			}
+
+			base.EmitTryBodyPrepare (ec);
 		}
 
 		protected override void EmitTryBody (EmitContext ec)
 		{
+			//
+			// Monitor.Enter (expr_copy, ref lock_taken)
+			//
+			if (lock_taken != null) {
+				expr_copy.Emit (ec);
+				lock_taken.LocalInfo.CreateBuilder (ec);
+				lock_taken.AddressOf (ec, AddressOp.Load);
+				ec.Emit (OpCodes.Call, ec.Module.PredefinedMembers.MonitorEnter_v4.Get ());
+			}
+
 			Statement.Emit (ec);
 		}
 
 		public override void EmitFinallyBody (EmitContext ec)
 		{
-			temp.Emit (ec);
-			ec.ig.Emit (OpCodes.Call, TypeManager.void_monitor_exit_object);
+			//
+			// if (lock_taken) Monitor.Exit (expr_copy)
+			//
+			Label skip = ec.DefineLabel ();
+
+			if (lock_taken != null) {
+				lock_taken.Emit (ec);
+				ec.Emit (OpCodes.Brfalse_S, skip);
+			}
+
+			expr_copy.Emit (ec);
+			var m = ec.Module.PredefinedMembers.MonitorExit.Resolve (loc);
+			if (m != null)
+				ec.Emit (OpCodes.Call, m);
+
+			ec.MarkLabel (skip);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		int ResolvePredefinedMethods (ResolveContext rc)
 		{
-			expr.MutateHoistedGenericType (storey);
-			temp.MutateHoistedGenericType (storey);
-			Statement.MutateHoistedGenericType (storey);
+			// Try 4.0 Monitor.Enter (object, ref bool) overload first
+			var m = rc.Module.PredefinedMembers.MonitorEnter_v4.Get ();
+			if (m != null)
+				return 4;
+
+			m = rc.Module.PredefinedMembers.MonitorEnter.Get ();
+			if (m != null)
+				return 1;
+
+			rc.Module.PredefinedMembers.MonitorEnter_v4.Resolve (loc);
+			return 0;
 		}
-		
+
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			Lock target = (Lock) t;
 
 			target.expr = expr.Clone (clonectx);
-			target.Statement = Statement.Clone (clonectx);
+			target.stmt = Statement.Clone (clonectx);
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
+
 	}
 
 	public class Unchecked : Statement {
 		public Block Block;
 		
-		public Unchecked (Block b)
+		public Unchecked (Block b, Location loc)
 		{
 			Block = b;
 			b.Unchecked = true;
+			this.loc = loc;
 		}
 
 		public override bool Resolve (BlockContext ec)
@@ -4200,13 +6058,19 @@ namespace Mono.CSharp {
 		
 		protected override void DoEmit (EmitContext ec)
 		{
-			using (ec.With (EmitContext.Options.AllCheckStateFlags, false))
+			using (ec.With (EmitContext.Options.CheckedScope, false))
 				Block.Emit (ec);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			Block.MutateHoistedGenericType (storey);
+			return Block.FlowAnalysis (fc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			return Block.MarkReachable (rc);
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -4215,15 +6079,21 @@ namespace Mono.CSharp {
 
 			target.Block = clonectx.LookupBlock (Block);
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
 
 	public class Checked : Statement {
 		public Block Block;
 		
-		public Checked (Block b)
+		public Checked (Block b, Location loc)
 		{
 			Block = b;
 			b.Unchecked = false;
+			this.loc = loc;
 		}
 
 		public override bool Resolve (BlockContext ec)
@@ -4234,13 +6104,19 @@ namespace Mono.CSharp {
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			using (ec.With (EmitContext.Options.AllCheckStateFlags, true))
+			using (ec.With (EmitContext.Options.CheckedScope, true))
 				Block.Emit (ec);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			Block.MutateHoistedGenericType (storey);
+			return Block.FlowAnalysis (fc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			return Block.MarkReachable (rc);
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -4249,16 +6125,21 @@ namespace Mono.CSharp {
 
 			target.Block = clonectx.LookupBlock (Block);
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
 
 	public class Unsafe : Statement {
 		public Block Block;
 
-		public Unsafe (Block b)
+		public Unsafe (Block b, Location loc)
 		{
 			Block = b;
 			Block.Unsafe = true;
-			loc = b.StartLocation;
+			this.loc = loc;
 		}
 
 		public override bool Resolve (BlockContext ec)
@@ -4275,9 +6156,15 @@ namespace Mono.CSharp {
 			Block.Emit (ec);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			Block.MutateHoistedGenericType (storey);
+			return Block.FlowAnalysis (fc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+			return Block.MarkReachable (rc);
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -4286,148 +6173,128 @@ namespace Mono.CSharp {
 
 			target.Block = clonectx.LookupBlock (Block);
 		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
+		}
 	}
 
 	// 
 	// Fixed statement
 	//
-	public class Fixed : Statement {
-		Expression type;
-		ArrayList declarators;
-		Statement statement;
-		Type expr_type;
-		Emitter[] data;
-		bool has_ret;
-
-		abstract class Emitter
+	public class Fixed : Statement
+	{
+		abstract class Emitter : ShimExpression
 		{
-			protected LocalInfo vi;
-			protected Expression converted;
+			protected LocalVariable vi;
 
-			protected Emitter (Expression expr, LocalInfo li)
+			protected Emitter (Expression expr, LocalVariable li)
+				: base (expr)
 			{
-				converted = expr;
 				vi = li;
 			}
 
-			public abstract void Emit (EmitContext ec);
 			public abstract void EmitExit (EmitContext ec);
+
+			public override void FlowAnalysis (FlowAnalysisContext fc)
+			{
+				expr.FlowAnalysis (fc);
+			}
 		}
 
 		class ExpressionEmitter : Emitter {
-			public ExpressionEmitter (Expression converted, LocalInfo li) :
+			public ExpressionEmitter (Expression converted, LocalVariable li) :
 				base (converted, li)
 			{
+			}
+
+			protected override Expression DoResolve (ResolveContext rc)
+			{
+				throw new NotImplementedException ();
 			}
 
 			public override void Emit (EmitContext ec) {
 				//
 				// Store pointer in pinned location
 				//
-				converted.Emit (ec);
+				expr.Emit (ec);
 				vi.EmitAssign (ec);
 			}
 
 			public override void EmitExit (EmitContext ec)
 			{
-				ec.ig.Emit (OpCodes.Ldc_I4_0);
-				ec.ig.Emit (OpCodes.Conv_U);
+				ec.EmitInt (0);
+				ec.Emit (OpCodes.Conv_U);
 				vi.EmitAssign (ec);
 			}
 		}
 
 		class StringEmitter : Emitter
 		{
-			LocalInfo pinned_string;
+			LocalVariable pinned_string;
 
-			public StringEmitter (Expression expr, LocalInfo li, Location loc):
-				base (expr, li)
+			public StringEmitter (Expression expr, LocalVariable li)
+				: base (expr, li)
 			{
-				pinned_string = new LocalInfo (new TypeExpression (TypeManager.string_type, loc), null, null, loc);
-				pinned_string.Pinned = true;
 			}
 
-			public StringEmitter Resolve (ResolveContext rc)
+			protected override Expression DoResolve (ResolveContext rc)
 			{
-				pinned_string.Resolve (rc);
+				pinned_string = new LocalVariable (vi.Block, "$pinned",
+					LocalVariable.Flags.FixedVariable | LocalVariable.Flags.CompilerGenerated | LocalVariable.Flags.Used,
+					vi.Location);
+				pinned_string.Type = rc.BuiltinTypes.String;
 
-				if (TypeManager.int_get_offset_to_string_data == null) {
-					TypeManager.int_get_offset_to_string_data = TypeManager.GetPredefinedProperty (
-						TypeManager.runtime_helpers_type, "OffsetToStringData", pinned_string.Location, TypeManager.int32_type);
-				}
-
+				eclass = ExprClass.Variable;
+				type = rc.BuiltinTypes.Int;
 				return this;
 			}
 
 			public override void Emit (EmitContext ec)
 			{
-				pinned_string.ResolveVariable (ec);
+				pinned_string.CreateBuilder (ec);
 
-				converted.Emit (ec);
+				expr.Emit (ec);
 				pinned_string.EmitAssign (ec);
 
 				// TODO: Should use Binary::Add
 				pinned_string.Emit (ec);
-				ec.ig.Emit (OpCodes.Conv_I);
+				ec.Emit (OpCodes.Conv_I);
 
-				PropertyExpr pe = new PropertyExpr (pinned_string.VariableType, TypeManager.int_get_offset_to_string_data, pinned_string.Location);
+				var m = ec.Module.PredefinedMembers.RuntimeHelpersOffsetToStringData.Resolve (loc);
+				if (m == null)
+					return;
+
+				PropertyExpr pe = new PropertyExpr (m, pinned_string.Location);
 				//pe.InstanceExpression = pinned_string;
 				pe.Resolve (new ResolveContext (ec.MemberContext)).Emit (ec);
 
-				ec.ig.Emit (OpCodes.Add);
+				ec.Emit (OpCodes.Add);
 				vi.EmitAssign (ec);
 			}
 
 			public override void EmitExit (EmitContext ec)
 			{
-				ec.ig.Emit (OpCodes.Ldnull);
+				ec.EmitNull ();
 				pinned_string.EmitAssign (ec);
 			}
 		}
 
-		public Fixed (Expression type, ArrayList decls, Statement stmt, Location l)
+		public class VariableDeclaration : BlockVariable
 		{
-			this.type = type;
-			declarators = decls;
-			statement = stmt;
-			loc = l;
-		}
-
-		public Statement Statement {
-			get { return statement; }
-		}
-
-		public override bool Resolve (BlockContext ec)
-		{
-			if (!ec.IsUnsafe){
-				Expression.UnsafeError (ec, loc);
-				return false;
-			}
-			
-			TypeExpr texpr = type.ResolveAsContextualType (ec, false);
-			if (texpr == null) {
-				if (type is VarExpr)
-					ec.Report.Error (821, type.Location, "A fixed statement cannot use an implicitly typed local variable");
-
-				return false;
+			public VariableDeclaration (FullNamedExpression type, LocalVariable li)
+				: base (type, li)
+			{
 			}
 
-			expr_type = texpr.Type;
-
-			data = new Emitter [declarators.Count];
-
-			if (!expr_type.IsPointer){
-				ec.Report.Error (209, loc, "The type of locals declared in a fixed statement must be a pointer type");
-				return false;
-			}
-			
-			int i = 0;
-			foreach (Pair p in declarators){
-				LocalInfo vi = (LocalInfo) p.First;
-				Expression e = (Expression) p.Second;
-				
-				vi.VariableInfo.SetAssigned (ec);
-				vi.SetReadOnlyContext (LocalInfo.ReadOnlyContext.Fixed);
+			protected override Expression ResolveInitializer (BlockContext bc, LocalVariable li, Expression initializer)
+			{
+				if (!Variable.Type.IsPointer && li == Variable) {
+					bc.Report.Error (209, TypeExpression.Location,
+						"The type of locals declared in a fixed statement must be a pointer type");
+					return null;
+				}
 
 				//
 				// The rules for the possible declarators are pretty wise,
@@ -4440,102 +6307,138 @@ namespace Mono.CSharp {
 				// is present, so we need to test for this particular case.
 				//
 
-				if (e is Cast){
-					ec.Report.Error (254, loc, "The right hand side of a fixed statement assignment may not be a cast expression");
-					return false;
+				if (initializer is Cast) {
+					bc.Report.Error (254, initializer.Location, "The right hand side of a fixed statement assignment may not be a cast expression");
+					return null;
 				}
 
-				using (ec.Set (ResolveContext.Options.FixedInitializerScope)) {
-					e = e.Resolve (ec);
-				}
+				initializer = initializer.Resolve (bc);
 
-				if (e == null)
-					return false;
+				if (initializer == null)
+					return null;
 
 				//
-				// Case 2: Array
+				// Case 1: Array
 				//
-				if (e.Type.IsArray){
-					Type array_type = TypeManager.GetElementType (e.Type);
-					
+				if (initializer.Type.IsArray) {
+					TypeSpec array_type = TypeManager.GetElementType (initializer.Type);
+
 					//
 					// Provided that array_type is unmanaged,
 					//
-					if (!TypeManager.VerifyUnManaged (array_type, loc))
-						return false;
+					if (!TypeManager.VerifyUnmanaged (bc.Module, array_type, loc))
+						return null;
 
 					//
 					// and T* is implicitly convertible to the
 					// pointer type given in the fixed statement.
 					//
-					ArrayPtr array_ptr = new ArrayPtr (e, array_type, loc);
-					
-					Expression converted = Convert.ImplicitConversionRequired (
-						ec, array_ptr, vi.VariableType, loc);
+					ArrayPtr array_ptr = new ArrayPtr (initializer, array_type, loc);
+
+					Expression converted = Convert.ImplicitConversionRequired (bc, array_ptr.Resolve (bc), li.Type, loc);
 					if (converted == null)
-						return false;
-					
+						return null;
+
 					//
 					// fixed (T* e_ptr = (e == null || e.Length == 0) ? null : converted [0])
 					//
-					converted = new Conditional (new Binary (Binary.Operator.LogicalOr,
-						new Binary (Binary.Operator.Equality, e, new NullLiteral (loc)),
-						new Binary (Binary.Operator.Equality, new MemberAccess (e, "Length"), new IntConstant (0, loc))),
-							new NullPointer (loc),
-							converted);
+					converted = new Conditional (new BooleanExpression (new Binary (Binary.Operator.LogicalOr,
+						new Binary (Binary.Operator.Equality, initializer, new NullLiteral (loc)),
+						new Binary (Binary.Operator.Equality, new MemberAccess (initializer, "Length"), new IntConstant (bc.BuiltinTypes, 0, loc)))),
+							new NullLiteral (loc),
+							converted, loc);
 
-					converted = converted.Resolve (ec);					
+					converted = converted.Resolve (bc);
 
-					data [i] = new ExpressionEmitter (converted, vi);
-					i++;
-
-					continue;
+					return new ExpressionEmitter (converted, li);
 				}
 
 				//
-				// Case 3: string
+				// Case 2: string
 				//
-				if (e.Type == TypeManager.string_type){
-					data [i] = new StringEmitter (e, vi, loc).Resolve (ec);
-					i++;
-					continue;
+				if (initializer.Type.BuiltinType == BuiltinTypeSpec.Type.String) {
+					return new StringEmitter (initializer, li).Resolve (bc);
 				}
 
-				// Case 4: fixed buffer
-				if (e is FixedBufferPtr) {
-					data [i++] = new ExpressionEmitter (e, vi);
-					continue;
+				// Case 3: fixed buffer
+				if (initializer is FixedBufferPtr) {
+					return new ExpressionEmitter (initializer, li);
 				}
 
 				//
-				// Case 1: & object.
+				// Case 4: & object.
 				//
-				Unary u = e as Unary;
+				bool already_fixed = true;
+				Unary u = initializer as Unary;
 				if (u != null && u.Oper == Unary.Operator.AddressOf) {
 					IVariableReference vr = u.Expr as IVariableReference;
 					if (vr == null || !vr.IsFixed) {
-						data [i] = new ExpressionEmitter (e, vi);
+						already_fixed = false;
 					}
 				}
 
-				if (data [i++] == null)
-					ec.Report.Error (213, vi.Location, "You cannot use the fixed statement to take the address of an already fixed expression");
+				if (already_fixed) {
+					bc.Report.Error (213, loc, "You cannot use the fixed statement to take the address of an already fixed expression");
+				}
 
-				e = Convert.ImplicitConversionRequired (ec, e, expr_type, loc);
+				initializer = Convert.ImplicitConversionRequired (bc, initializer, li.Type, loc);
+				return new ExpressionEmitter (initializer, li);
+			}
+		}
+
+
+		VariableDeclaration decl;
+		Statement statement;
+		bool has_ret;
+
+		public Fixed (VariableDeclaration decl, Statement stmt, Location l)
+		{
+			this.decl = decl;
+			statement = stmt;
+			loc = l;
+		}
+
+		#region Properties
+
+		public Statement Statement {
+			get {
+				return statement;
+			}
+		}
+
+		public BlockVariable Variables {
+			get {
+				return decl;
+			}
+		}
+
+		#endregion
+
+		public override bool Resolve (BlockContext bc)
+		{
+			using (bc.Set (ResolveContext.Options.FixedInitializerScope)) {
+				if (!decl.Resolve (bc))
+					return false;
 			}
 
-			ec.StartFlowBranching (FlowBranching.BranchingType.Conditional, loc);
-			bool ok = statement.Resolve (ec);
-			bool flow_unreachable = ec.EndFlowBranching ();
-			has_ret = flow_unreachable;
+			return statement.Resolve (bc);
+		}
 
-			return ok;
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			decl.FlowAnalysis (fc);
+			return statement.FlowAnalysis (fc);
 		}
 		
 		protected override void DoEmit (EmitContext ec)
 		{
-			for (int i = 0; i < data.Length; i++) {
-				data [i].Emit (ec);
+			decl.Variable.CreateBuilder (ec);
+			decl.Initializer.Emit (ec);
+			if (decl.Declarators != null) {
+				foreach (var d in decl.Declarators) {
+					d.Variable.CreateBuilder (ec);
+					d.Initializer.Emit (ec);
+				}
 			}
 
 			statement.Emit (ec);
@@ -4546,56 +6449,138 @@ namespace Mono.CSharp {
 			//
 			// Clear the pinned variable
 			//
-			for (int i = 0; i < data.Length; i++) {
-				data [i].EmitExit (ec);
+			((Emitter) decl.Initializer).EmitExit (ec);
+			if (decl.Declarators != null) {
+				foreach (var d in decl.Declarators) {
+					((Emitter)d.Initializer).EmitExit (ec);
+				}
 			}
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		public override Reachability MarkReachable (Reachability rc)
 		{
-			// Fixed statement cannot be used inside anonymous methods or lambdas
-			throw new NotSupportedException ();
+			base.MarkReachable (rc);
+
+			decl.MarkReachable (rc);
+
+			rc = statement.MarkReachable (rc);
+
+			// TODO: What if there is local exit?
+			has_ret = rc.IsUnreachable;
+			return rc;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			Fixed target = (Fixed) t;
 
-			target.type = type.Clone (clonectx);
-			target.declarators = new ArrayList (declarators.Count);
-			foreach (Pair p in declarators) {
-				LocalInfo vi = (LocalInfo) p.First;
-				Expression e = (Expression) p.Second;
-
-				target.declarators.Add (
-					new Pair (clonectx.LookupVariable (vi), e.Clone (clonectx)));				
-			}
-			
+			target.decl = (VariableDeclaration) decl.Clone (clonectx);
 			target.statement = statement.Clone (clonectx);
 		}
-	}
-	
-	public class Catch : Statement {
-		public readonly string Name;
-		public Block  Block;
-		public Block  VarBlock;
-
-		Expression type_expr;
-		Type type;
 		
-		public Catch (Expression type, string name, Block block, Block var_block, Location l)
+		public override object Accept (StructuralVisitor visitor)
 		{
-			type_expr = type;
-			Name = name;
-			Block = block;
-			VarBlock = var_block;
-			loc = l;
+			return visitor.Visit (this);
+		}
+	}
+
+	public class Catch : Statement
+	{
+		class FilterStatement : Statement
+		{
+			readonly Catch ctch;
+
+			public FilterStatement (Catch ctch)
+			{
+				this.ctch = ctch;
+			}
+
+			protected override void CloneTo (CloneContext clonectx, Statement target)
+			{
+			}
+
+			protected override void DoEmit (EmitContext ec)
+			{
+				if (ctch.li != null) {
+					if (ctch.hoisted_temp != null)
+						ctch.hoisted_temp.Emit (ec);
+					else
+						ctch.li.Emit (ec);
+
+					if (!ctch.IsGeneral && ctch.type.Kind == MemberKind.TypeParameter)
+						ec.Emit (OpCodes.Box, ctch.type);
+				}
+
+				var expr_start = ec.DefineLabel ();
+				var end = ec.DefineLabel ();
+
+				ec.Emit (OpCodes.Brtrue_S, expr_start);
+				ec.EmitInt (0);
+				ec.Emit (OpCodes.Br, end);
+				ec.MarkLabel (expr_start);
+
+				ctch.Filter.Emit (ec);
+
+				ec.MarkLabel (end);
+				ec.Emit (OpCodes.Endfilter);
+				ec.BeginFilterHandler ();
+				ec.Emit (OpCodes.Pop);
+			}
+
+			protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+			{
+				ctch.Filter.FlowAnalysis (fc);
+				return true;
+			}
+
+			public override bool Resolve (BlockContext bc)
+			{
+				ctch.Filter = ctch.Filter.Resolve (bc);
+
+				if (ctch.Filter != null) {
+					if (ctch.Filter.ContainsEmitWithAwait ()) {
+						bc.Report.Error (7094, ctch.Filter.Location, "The `await' operator cannot be used in the filter expression of a catch clause");
+					}
+
+					var c = ctch.Filter as Constant;
+					if (c != null && !c.IsDefaultValue) {
+						bc.Report.Warning (7095, 1, ctch.Filter.Location, "Exception filter expression is a constant");
+					}
+				}
+
+				return true;
+			}
 		}
 
-		public Type CatchType {
+		ExplicitBlock block;
+		LocalVariable li;
+		FullNamedExpression type_expr;
+		CompilerAssign assign;
+		TypeSpec type;
+		LocalTemporary hoisted_temp;
+
+		public Catch (ExplicitBlock block, Location loc)
+		{
+			this.block = block;
+			this.loc = loc;
+		}
+
+		#region Properties
+
+		public ExplicitBlock Block {
+			get {
+				return block;
+			}
+		}
+
+		public TypeSpec CatchType {
 			get {
 				return type;
 			}
+		}
+
+		public Expression Filter {
+			get; set;
 		}
 
 		public bool IsGeneral {
@@ -4604,82 +6589,153 @@ namespace Mono.CSharp {
 			}
 		}
 
-		protected override void DoEmit (EmitContext ec)
-		{
-			ILGenerator ig = ec.ig;
-
-			if (CatchType != null)
-				ig.BeginCatchBlock (CatchType);
-			else
-				ig.BeginCatchBlock (TypeManager.object_type);
-
-			if (VarBlock != null)
-				VarBlock.Emit (ec);
-
-			if (Name != null) {
-				// TODO: Move to resolve
-				LocalVariableReference lvr = new LocalVariableReference (Block, Name, loc);
-				lvr.Resolve (new ResolveContext (ec.MemberContext));
-				
-#if GMCS_SOURCE
-				// Only to make verifier happy
-				if (TypeManager.IsGenericParameter (lvr.Type))
-					ig.Emit (OpCodes.Unbox_Any, lvr.Type);
-#endif
-
-				Expression source;
-				if (lvr.IsHoisted) {
-					LocalTemporary lt = new LocalTemporary (lvr.Type);
-					lt.Store (ec);
-					source = lt;
-				} else {
-					// Variable is at the top of the stack
-					source = EmptyExpression.Null;
-				}
-
-				lvr.EmitAssign (ec, source, false, false);
-			} else
-				ig.Emit (OpCodes.Pop);
-
-			Block.Emit (ec);
-		}
-
-		public override bool Resolve (BlockContext ec)
-		{
-			using (ec.With (ResolveContext.Options.CatchScope, true)) {
-				if (type_expr != null) {
-					TypeExpr te = type_expr.ResolveAsTypeTerminal (ec, false);
-					if (te == null)
-						return false;
-
-					type = te.Type;
-
-					if (type != TypeManager.exception_type && !TypeManager.IsSubclassOf (type, TypeManager.exception_type)){
-						ec.Report.Error (155, loc, "The type caught or thrown must be derived from System.Exception");
-						return false;
-					}
-				} else
-					type = null;
-
-				if (!Block.Resolve (ec))
-					return false;
-
-				// Even though VarBlock surrounds 'Block' we resolve it later, so that we can correctly
-				// emit the "unused variable" warnings.
-				if (VarBlock != null)
-					return VarBlock.Resolve (ec);
-
-				return true;
+		public FullNamedExpression TypeExpression {
+			get {
+				return type_expr;
+			}
+			set {
+				type_expr = value;
 			}
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		public LocalVariable Variable {
+			get {
+				return li;
+			}
+			set {
+				li = value;
+			}
+		}
+
+		#endregion
+
+		protected override void DoEmit (EmitContext ec)
 		{
-			if (type != null)
-				type = storey.MutateType (type);
-			if (VarBlock != null)
-				VarBlock.MutateHoistedGenericType (storey);
-			Block.MutateHoistedGenericType (storey);
+			if (Filter != null) {
+				ec.BeginExceptionFilterBlock ();
+				ec.Emit (OpCodes.Isinst, IsGeneral ? ec.BuiltinTypes.Object : CatchType);
+
+				if (li != null)
+					EmitCatchVariableStore (ec);
+
+				if (Block.HasAwait) {
+					Block.EmitScopeInitialization (ec);
+				} else {
+					Block.Emit (ec);
+				}
+
+				return;
+			}
+
+			if (IsGeneral)
+				ec.BeginCatchBlock (ec.BuiltinTypes.Object);
+			else
+				ec.BeginCatchBlock (CatchType);
+
+			if (li != null) {
+				EmitCatchVariableStore (ec);
+			} else {
+				ec.Emit (OpCodes.Pop);
+			}
+
+			if (!Block.HasAwait)
+				Block.Emit (ec);
+		}
+
+		void EmitCatchVariableStore (EmitContext ec)
+		{
+			li.CreateBuilder (ec);
+
+			//
+			// Special case hoisted catch variable, we have to use a temporary variable
+			// to pass via anonymous storey initialization with the value still on top
+			// of the stack
+			//
+			if (li.HoistedVariant != null) {
+				hoisted_temp = new LocalTemporary (li.Type);
+				hoisted_temp.Store (ec);
+
+				// switch to assignment from temporary variable and not from top of the stack
+				assign.UpdateSource (hoisted_temp);
+			}
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			using (bc.Set (ResolveContext.Options.CatchScope)) {
+				if (type_expr == null) {
+					if (CreateExceptionVariable (bc.Module.Compiler.BuiltinTypes.Object)) {
+						Expression source = new EmptyExpression (li.Type);
+						assign = new CompilerAssign (new LocalVariableReference (li, Location.Null), source, Location.Null);
+						Block.AddScopeStatement (new StatementExpression (assign, Location.Null));
+					}
+				} else {
+					type = type_expr.ResolveAsType (bc);
+					if (type == null)
+						return false;
+
+					if (li == null)
+						CreateExceptionVariable (type);
+
+					if (type.BuiltinType != BuiltinTypeSpec.Type.Exception && !TypeSpec.IsBaseClass (type, bc.BuiltinTypes.Exception, false)) {
+						bc.Report.Error (155, loc, "The type caught or thrown must be derived from System.Exception");
+					} else if (li != null) {
+						li.Type = type;
+						li.PrepareAssignmentAnalysis (bc);
+
+						// source variable is at the top of the stack
+						Expression source = new EmptyExpression (li.Type);
+						if (li.Type.IsGenericParameter)
+							source = new UnboxCast (source, li.Type);
+
+						//
+						// Uses Location.Null to hide from symbol file
+						//
+						assign = new CompilerAssign (new LocalVariableReference (li, Location.Null), source, Location.Null);
+						Block.AddScopeStatement (new StatementExpression (assign, Location.Null));
+					}
+				}
+
+				if (Filter != null) {
+					Block.AddScopeStatement (new FilterStatement (this));
+				}
+
+				Block.SetCatchBlock ();
+				return Block.Resolve (bc);
+			}
+		}
+
+		bool CreateExceptionVariable (TypeSpec type)
+		{
+			if (!Block.HasAwait)
+				return false;
+
+			// TODO: Scan the block for rethrow expression
+			//if (!Block.HasRethrow)
+			//	return;
+
+			li = LocalVariable.CreateCompilerGenerated (type, block, Location.Null);
+			return true;
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			if (li != null && !li.IsCompilerGenerated) {
+				fc.SetVariableAssigned (li.VariableInfo, true);
+			}
+
+			return block.FlowAnalysis (fc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			var c = Filter as Constant;
+			if (c != null && c.IsDefaultValue)
+				return Reachability.CreateUnreachable ();
+
+			return block.MarkReachable (rc);
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -4687,197 +6743,485 @@ namespace Mono.CSharp {
 			Catch target = (Catch) t;
 
 			if (type_expr != null)
-				target.type_expr = type_expr.Clone (clonectx);
-			if (VarBlock != null)
-				target.VarBlock = clonectx.LookupBlock (VarBlock);			
-			target.Block = clonectx.LookupBlock (Block);
+				target.type_expr = (FullNamedExpression) type_expr.Clone (clonectx);
+
+			if (Filter != null)
+				target.Filter = Filter.Clone (clonectx);
+
+			target.block = (ExplicitBlock) clonectx.LookupBlock (block);
 		}
 	}
 
-	public class TryFinally : ExceptionStatement {
-		Statement stmt;
-		Block fini;
+	public class TryFinally : TryFinallyBlock
+	{
+		ExplicitBlock fini;
+		List<DefiniteAssignmentBitSet> try_exit_dat;
+		List<Label> redirected_jumps;
+		Label? start_fin_label;
 
-		public TryFinally (Statement stmt, Block fini, Location l)
+		public TryFinally (Statement stmt, ExplicitBlock fini, Location loc)
+			 : base (stmt, loc)
 		{
-			this.stmt = stmt;
 			this.fini = fini;
-			loc = l;
 		}
 
-		public override bool Resolve (BlockContext ec)
-		{
-			bool ok = true;
-
-			ec.StartFlowBranching (this);
-
-			if (!stmt.Resolve (ec))
-				ok = false;
-
-			if (ok)
-				ec.CurrentBranching.CreateSibling (fini, FlowBranching.SiblingType.Finally);
-			using (ec.With (ResolveContext.Options.FinallyScope, true)) {
-				if (!fini.Resolve (ec))
-					ok = false;
+		public ExplicitBlock FinallyBlock {
+			get {
+ 				return fini;
 			}
+		}
 
-			ec.EndFlowBranching ();
+		public void RegisterForControlExitCheck (DefiniteAssignmentBitSet vector)
+		{
+			if (try_exit_dat == null)
+				try_exit_dat = new List<DefiniteAssignmentBitSet> ();
 
-			ok &= base.Resolve (ec);
+			try_exit_dat.Add (vector);
+		}
+
+		public override bool Resolve (BlockContext bc)
+		{
+			bool ok = base.Resolve (bc);
+
+			fini.SetFinallyBlock ();
+			using (bc.Set (ResolveContext.Options.FinallyScope)) {
+				ok &= fini.Resolve (bc);
+			}
 
 			return ok;
 		}
 
-		protected override void EmitPreTryBody (EmitContext ec)
-		{
-		}
-
 		protected override void EmitTryBody (EmitContext ec)
 		{
+			if (fini.HasAwait) {
+				if (ec.TryFinallyUnwind == null)
+					ec.TryFinallyUnwind = new List<TryFinally> ();
+
+				ec.TryFinallyUnwind.Add (this);
+				stmt.Emit (ec);
+				ec.TryFinallyUnwind.Remove (this);
+
+				if (start_fin_label != null)
+					ec.MarkLabel (start_fin_label.Value);
+
+				return;
+			}
+
 			stmt.Emit (ec);
+		}
+
+		protected override bool EmitBeginFinallyBlock (EmitContext ec)
+		{
+			if (fini.HasAwait)
+				return false;
+
+			return base.EmitBeginFinallyBlock (ec);
 		}
 
 		public override void EmitFinallyBody (EmitContext ec)
 		{
+			if (!fini.HasAwait) {
+				fini.Emit (ec);
+				return;
+			}
+
+			//
+			// Emits catch block like
+			//
+			// catch (object temp) {
+			//	this.exception_field = temp;
+			// }
+			//
+			var type = ec.BuiltinTypes.Object;
+			ec.BeginCatchBlock (type);
+
+			var temp = ec.GetTemporaryLocal (type);
+			ec.Emit (OpCodes.Stloc, temp);
+
+			var exception_field = ec.GetTemporaryField (type);
+			ec.EmitThis ();
+			ec.Emit (OpCodes.Ldloc, temp);
+			exception_field.EmitAssignFromStack (ec);
+
+			ec.EndExceptionBlock ();
+
+			ec.FreeTemporaryLocal (temp, type);
+
 			fini.Emit (ec);
+
+			//
+			// Emits exception rethrow
+			//
+			// if (this.exception_field != null)
+			//	throw this.exception_field;
+			//
+			exception_field.Emit (ec);
+			var skip_throw = ec.DefineLabel ();
+			ec.Emit (OpCodes.Brfalse_S, skip_throw);
+			exception_field.Emit (ec);
+			ec.Emit (OpCodes.Throw);
+			ec.MarkLabel (skip_throw);
+
+			exception_field.IsAvailableForReuse = true;
+
+			EmitUnwindFinallyTable (ec);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		bool IsParentBlock (Block block)
 		{
-			stmt.MutateHoistedGenericType (storey);
-			fini.MutateHoistedGenericType (storey);
+			for (Block b = fini; b != null; b = b.Parent) {
+				if (b == block)
+					return true;
+			}
+
+			return false;
+		}
+
+		public static Label EmitRedirectedJump (EmitContext ec, AsyncInitializer initializer, Label label, Block labelBlock)
+		{
+			int idx;
+			if (labelBlock != null) {
+				for (idx = ec.TryFinallyUnwind.Count; idx != 0; --idx) {
+					var fin = ec.TryFinallyUnwind [idx - 1];
+					if (!fin.IsParentBlock (labelBlock))
+						break;
+				}
+			} else {
+				idx = 0;
+			}
+
+			bool set_return_state = true;
+
+			for (; idx < ec.TryFinallyUnwind.Count; ++idx) {
+				var fin = ec.TryFinallyUnwind [idx];
+				if (labelBlock != null && !fin.IsParentBlock (labelBlock))
+					break;
+
+				fin.EmitRedirectedExit (ec, label, initializer, set_return_state);
+				set_return_state = false;
+
+				if (fin.start_fin_label == null) {
+					fin.start_fin_label = ec.DefineLabel ();
+				}
+
+				label = fin.start_fin_label.Value;
+			}
+
+			return label;
+		}
+
+		public static Label EmitRedirectedReturn (EmitContext ec, AsyncInitializer initializer)
+		{
+			return EmitRedirectedJump (ec, initializer, initializer.BodyEnd, null);
+		}
+
+		void EmitRedirectedExit (EmitContext ec, Label label, AsyncInitializer initializer, bool setReturnState)
+		{
+			if (redirected_jumps == null) {
+				redirected_jumps = new List<Label> ();
+
+				// Add fallthrough label
+				redirected_jumps.Add (ec.DefineLabel ());
+
+				if (setReturnState)
+					initializer.HoistedReturnState = ec.GetTemporaryField (ec.Module.Compiler.BuiltinTypes.Int, true);
+			}
+
+			int index = redirected_jumps.IndexOf (label);
+			if (index < 0) {
+				redirected_jumps.Add (label);
+				index = redirected_jumps.Count - 1;
+			}
+
+			//
+			// Indicates we have captured exit jump
+			//
+			if (setReturnState) {
+				var value = new IntConstant (initializer.HoistedReturnState.Type, index, Location.Null);
+				initializer.HoistedReturnState.EmitAssign (ec, value, false, false);
+			}
+		}
+
+		//
+		// Emits state table of jumps outside of try block and reload of return
+		// value when try block returns value
+		//
+		void EmitUnwindFinallyTable (EmitContext ec)
+		{
+			if (redirected_jumps == null)
+				return;
+
+			var initializer = (AsyncInitializer)ec.CurrentAnonymousMethod;
+			initializer.HoistedReturnState.EmitLoad (ec);
+			ec.Emit (OpCodes.Switch, redirected_jumps.ToArray ());
+
+			// Mark fallthrough label
+			ec.MarkLabel (redirected_jumps [0]);
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			var da = fc.BranchDefiniteAssignment ();
+
+			var tf = fc.TryFinally;
+			fc.TryFinally = this;
+
+			var res_stmt = Statement.FlowAnalysis (fc);
+
+			fc.TryFinally = tf;
+
+			var try_da = fc.DefiniteAssignment;
+			fc.DefiniteAssignment = da;
+
+			var res_fin = fini.FlowAnalysis (fc);
+
+			if (try_exit_dat != null) {
+				//
+				// try block has global exit but we need to run definite assignment check
+				// for parameter block out parameter after finally block because it's always
+				// executed before exit
+				//
+				foreach (var try_da_part in try_exit_dat)
+					fc.ParametersBlock.CheckControlExit (fc, fc.DefiniteAssignment | try_da_part);
+
+				try_exit_dat = null;
+			}
+
+			fc.DefiniteAssignment |= try_da;
+			return res_stmt | res_fin;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			//
+			// Mark finally block first for any exit statement in try block
+			// to know whether the code which follows finally is reachable
+			//
+			return fini.MarkReachable (rc) | base.MarkReachable (rc);
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			TryFinally target = (TryFinally) t;
 
-			target.stmt = (Statement) stmt.Clone (clonectx);
+			target.stmt = stmt.Clone (clonectx);
 			if (fini != null)
-				target.fini = clonectx.LookupBlock (fini);
+				target.fini = (ExplicitBlock) clonectx.LookupBlock (fini);
+		}
+		
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
-	public class TryCatch : Statement {
+	public class TryCatch : ExceptionStatement
+	{
 		public Block Block;
-		public ArrayList Specific;
-		public Catch General;
-		bool inside_try_finally, code_follows;
+		List<Catch> clauses;
+		readonly bool inside_try_finally;
+		List<Catch> catch_sm;
 
-		public TryCatch (Block block, ArrayList catch_clauses, Location l, bool inside_try_finally)
+		public TryCatch (Block block, List<Catch> catch_clauses, Location l, bool inside_try_finally)
+			: base (l)
 		{
 			this.Block = block;
-			this.Specific = catch_clauses;
+			this.clauses = catch_clauses;
 			this.inside_try_finally = inside_try_finally;
-
-			Catch c = (Catch) catch_clauses [0];
-			if (c.IsGeneral) {
-				this.General = c;			
-				catch_clauses.RemoveAt (0);
-			}
-
-			loc = l;
 		}
 
-		public override bool Resolve (BlockContext ec)
+		public List<Catch> Clauses {
+			get {
+				return clauses;
+			}
+		}
+
+		public bool IsTryCatchFinally {
+			get {
+				return inside_try_finally;
+			}
+		}
+
+		public override bool Resolve (BlockContext bc)
 		{
-			bool ok = true;
+			bool ok;
 
-			ec.StartFlowBranching (this);
+			using (bc.Set (ResolveContext.Options.TryScope)) {
+				parent = bc.CurrentTryBlock;
 
-			if (!Block.Resolve (ec))
-				ok = false;
+				if (IsTryCatchFinally) {
+					ok = Block.Resolve (bc);
+				} else {
+					using (bc.Set (ResolveContext.Options.TryWithCatchScope)) {
+						bc.CurrentTryBlock = this;
+						ok = Block.Resolve (bc);
+						bc.CurrentTryBlock = parent;
+					}
+				}
+			}
 
-			Type[] prev_catches = new Type [Specific.Count];
-			int last_index = 0;
-			foreach (Catch c in Specific){
-				ec.CurrentBranching.CreateSibling (c.Block, FlowBranching.SiblingType.Catch);
+			for (int i = 0; i < clauses.Count; ++i) {
+				var c = clauses[i];
 
-				if (c.Name != null) {
-					LocalInfo vi = c.Block.GetLocalInfo (c.Name);
-					if (vi == null)
-						throw new Exception ();
+				ok &= c.Resolve (bc);
 
-					vi.VariableInfo = null;
+				if (c.Block.HasAwait) {
+					if (catch_sm == null)
+						catch_sm = new List<Catch> ();
+
+					catch_sm.Add (c);
 				}
 
-				if (!c.Resolve (ec)) {
-					ok = false;
+				if (c.Filter != null)
 					continue;
-				}
 
-				Type resolved_type = c.CatchType;
-				for (int ii = 0; ii < last_index; ++ii) {
-					if (resolved_type == prev_catches [ii] || TypeManager.IsSubclassOf (resolved_type, prev_catches [ii])) {
-						ec.Report.Error (160, c.loc,
+				TypeSpec resolved_type = c.CatchType;
+				if (resolved_type == null)
+					continue;
+
+				for (int ii = 0; ii < clauses.Count; ++ii) {
+					if (ii == i)
+						continue;
+
+					if (clauses[ii].Filter != null)
+						continue;
+
+					if (clauses[ii].IsGeneral) {
+						if (resolved_type.BuiltinType != BuiltinTypeSpec.Type.Exception)
+							continue;
+
+						if (!bc.Module.DeclaringAssembly.WrapNonExceptionThrows)
+							continue;
+
+						if (!bc.Module.PredefinedAttributes.RuntimeCompatibility.IsDefined)
+							continue;
+
+						bc.Report.Warning (1058, 1, c.loc,
+							"A previous catch clause already catches all exceptions. All non-exceptions thrown will be wrapped in a `System.Runtime.CompilerServices.RuntimeWrappedException'");
+
+						continue;
+					}
+
+					if (ii >= i)
+						continue;
+
+					var ct = clauses[ii].CatchType;
+					if (ct == null)
+						continue;
+
+					if (resolved_type == ct || TypeSpec.IsBaseClass (resolved_type, ct, true)) {
+						bc.Report.Error (160, c.loc,
 							"A previous catch clause already catches all exceptions of this or a super type `{0}'",
-							TypeManager.CSharpName (prev_catches [ii]));
+							ct.GetSignatureForError ());
 						ok = false;
 					}
 				}
-
-				prev_catches [last_index++] = resolved_type;
 			}
 
-			if (General != null) {
-				if (CodeGen.Assembly.WrapNonExceptionThrows) {
-					foreach (Catch c in Specific){
-						if (c.CatchType == TypeManager.exception_type && PredefinedAttributes.Get.RuntimeCompatibility.IsDefined) {
-							ec.Report.Warning (1058, 1, c.loc, "A previous catch clause already catches all exceptions. All non-exceptions thrown will be wrapped in a `System.Runtime.CompilerServices.RuntimeWrappedException'");
-						}
-					}
-				}
-
-				ec.CurrentBranching.CreateSibling (General.Block, FlowBranching.SiblingType.Catch);
-
-				if (!General.Resolve (ec))
-					ok = false;
-			}
-
-			ec.EndFlowBranching ();
-
-			// System.Reflection.Emit automatically emits a 'leave' at the end of a try/catch clause
-			// So, ensure there's some IL code after this statement
-			if (!inside_try_finally && !code_follows && ec.CurrentBranching.CurrentUsageVector.IsUnreachable)
-				ec.NeedReturnLabel ();
-
-			return ok;
+			return base.Resolve (bc) && ok;
 		}
 
-		public void SomeCodeFollows ()
+		protected sealed override void DoEmit (EmitContext ec)
 		{
-			code_follows = true;
-		}
-		
-		protected override void DoEmit (EmitContext ec)
-		{
-			ILGenerator ig = ec.ig;
-
 			if (!inside_try_finally)
-				ig.BeginExceptionBlock ();
+				EmitTryBodyPrepare (ec);
 
 			Block.Emit (ec);
 
-			foreach (Catch c in Specific)
+			LocalBuilder state_variable = null;
+			foreach (Catch c in clauses) {
 				c.Emit (ec);
 
-			if (General != null)
-				General.Emit (ec);
+				if (catch_sm != null) {
+					if (state_variable == null) {
+						//
+						// Cannot reuse temp variable because non-catch path assumes the value is 0
+						// which may not be true for reused local variable
+						//
+						state_variable = ec.DeclareLocal (ec.Module.Compiler.BuiltinTypes.Int, false);
+					}
+
+					var index = catch_sm.IndexOf (c);
+					if (index < 0)
+						continue;
+
+					ec.EmitInt (index + 1);
+					ec.Emit (OpCodes.Stloc, state_variable);
+				}
+			}
 
 			if (!inside_try_finally)
-				ig.EndExceptionBlock ();
+				ec.EndExceptionBlock ();
+
+			if (state_variable != null) {
+				ec.Emit (OpCodes.Ldloc, state_variable);
+
+				var labels = new Label [catch_sm.Count + 1];
+				for (int i = 0; i < labels.Length; ++i) {
+					labels [i] = ec.DefineLabel ();
+				}
+
+				var end = ec.DefineLabel ();
+				ec.Emit (OpCodes.Switch, labels);
+
+				// 0 value is default label
+				ec.MarkLabel (labels [0]);
+				ec.Emit (OpCodes.Br, end);
+
+				var atv = ec.AsyncThrowVariable;
+				Catch c = null;
+				for (int i = 0; i < catch_sm.Count; ++i) {
+					if (c != null && c.Block.HasReachableClosingBrace)
+						ec.Emit (OpCodes.Br, end);
+
+					ec.MarkLabel (labels [i + 1]);
+					c = catch_sm [i];
+					ec.AsyncThrowVariable = c.Variable;
+					c.Block.Emit (ec);
+				}
+				ec.AsyncThrowVariable = atv;
+
+				ec.MarkLabel (end);
+			}
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			Block.MutateHoistedGenericType (storey);
+			var start_fc = fc.BranchDefiniteAssignment ();
+			var res = Block.FlowAnalysis (fc);
 
-			if (General != null)
-				General.MutateHoistedGenericType (storey);
-			if (Specific != null) {
-				foreach (Catch c in Specific)
-					c.MutateHoistedGenericType (storey);
+			DefiniteAssignmentBitSet try_fc = res ? null : fc.DefiniteAssignment;
+
+			foreach (var c in clauses) {
+				fc.DefiniteAssignment = new DefiniteAssignmentBitSet (start_fc);
+				if (!c.FlowAnalysis (fc)) {
+					if (try_fc == null)
+						try_fc = fc.DefiniteAssignment;
+					else
+						try_fc &= fc.DefiniteAssignment;
+
+					res = false;
+				}
 			}
+
+			fc.DefiniteAssignment = try_fc ?? start_fc;
+			parent = null;
+			return res;
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			if (rc.IsUnreachable)
+				return rc;
+
+			base.MarkReachable (rc);
+
+			var tc_rc = Block.MarkReachable (rc);
+
+			foreach (var c in clauses)
+				tc_rc &= c.MarkReachable (rc);
+
+			return tc_rc;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -4885,161 +7229,231 @@ namespace Mono.CSharp {
 			TryCatch target = (TryCatch) t;
 
 			target.Block = clonectx.LookupBlock (Block);
-			if (General != null)
-				target.General = (Catch) General.Clone (clonectx);
-			if (Specific != null){
-				target.Specific = new ArrayList ();
-				foreach (Catch c in Specific)
-					target.Specific.Add (c.Clone (clonectx));
+			if (clauses != null){
+				target.clauses = new List<Catch> ();
+				foreach (Catch c in clauses)
+					target.clauses.Add ((Catch) c.Clone (clonectx));
 			}
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
-	// FIXME: Why is it almost exact copy of Using ??
-	public class UsingTemporary : ExceptionStatement {
-		TemporaryVariable local_copy;
-		public Statement Statement;
-		Expression expr;
-		Type expr_type;
-
-		public UsingTemporary (Expression expr, Statement stmt, Location l)
+	public class Using : TryFinallyBlock
+	{
+		public class VariableDeclaration : BlockVariable
 		{
-			this.expr = expr;
-			Statement = stmt;
-			loc = l;
-		}
+			Statement dispose_call;
 
-		public override bool Resolve (BlockContext ec)
-		{
-			expr = expr.Resolve (ec);
-			if (expr == null)
-				return false;
+			public VariableDeclaration (FullNamedExpression type, LocalVariable li)
+				: base (type, li)
+			{
+			}
 
-			expr_type = expr.Type;
+			public VariableDeclaration (LocalVariable li, Location loc)
+				: base (li)
+			{
+				reachable = true;
+				this.loc = loc;
+			}
 
-			if (!TypeManager.ImplementsInterface (expr_type, TypeManager.idisposable_type)) {
-				if (Convert.ImplicitConversion (ec, expr, TypeManager.idisposable_type, loc) == null) {
-					Using.Error_IsNotConvertibleToIDisposable (ec, expr);
-					return false;
+			public VariableDeclaration (Expression expr)
+				: base (null)
+			{
+				loc = expr.Location;
+				Initializer = expr;
+			}
+
+			#region Properties
+
+			public bool IsNested { get; private set; }
+
+			#endregion
+
+			public void EmitDispose (EmitContext ec)
+			{
+				dispose_call.Emit (ec);
+			}
+
+			public override bool Resolve (BlockContext bc)
+			{
+				if (IsNested)
+					return true;
+
+				return base.Resolve (bc, false);
+			}
+
+			public Expression ResolveExpression (BlockContext bc)
+			{
+				var e = Initializer.Resolve (bc);
+				if (e == null)
+					return null;
+
+				li = LocalVariable.CreateCompilerGenerated (e.Type, bc.CurrentBlock, loc);
+				Initializer = ResolveInitializer (bc, Variable, e);
+				return e;
+			}
+
+			protected override Expression ResolveInitializer (BlockContext bc, LocalVariable li, Expression initializer)
+			{
+				if (li.Type.BuiltinType == BuiltinTypeSpec.Type.Dynamic) {
+					initializer = initializer.Resolve (bc);
+					if (initializer == null)
+						return null;
+
+					// Once there is dynamic used defer conversion to runtime even if we know it will never succeed
+					Arguments args = new Arguments (1);
+					args.Add (new Argument (initializer));
+					initializer = new DynamicConversion (bc.BuiltinTypes.IDisposable, 0, args, initializer.Location).Resolve (bc);
+					if (initializer == null)
+						return null;
+
+					var var = LocalVariable.CreateCompilerGenerated (initializer.Type, bc.CurrentBlock, loc);
+					dispose_call = CreateDisposeCall (bc, var);
+					dispose_call.Resolve (bc);
+
+					return base.ResolveInitializer (bc, li, new SimpleAssign (var.CreateReferenceExpression (bc, loc), initializer, loc));
+				}
+
+				if (li == Variable) {
+					CheckIDiposableConversion (bc, li, initializer);
+					dispose_call = CreateDisposeCall (bc, li);
+					dispose_call.Resolve (bc);
+				}
+
+				return base.ResolveInitializer (bc, li, initializer);
+			}
+
+			protected virtual void CheckIDiposableConversion (BlockContext bc, LocalVariable li, Expression initializer)
+			{
+				var type = li.Type;
+
+				if (type.BuiltinType != BuiltinTypeSpec.Type.IDisposable && !CanConvertToIDisposable (bc, type)) {
+					if (type.IsNullableType) {
+						// it's handled in CreateDisposeCall
+						return;
+					}
+
+					if (type != InternalType.ErrorType) {
+						bc.Report.SymbolRelatedToPreviousError (type);
+						var loc = type_expr == null ? initializer.Location : type_expr.Location;
+						bc.Report.Error (1674, loc, "`{0}': type used in a using statement must be implicitly convertible to `System.IDisposable'",
+							type.GetSignatureForError ());
+					}
+
+					return;
 				}
 			}
 
-			local_copy = new TemporaryVariable (expr_type, loc);
-			local_copy.Resolve (ec);
+			static bool CanConvertToIDisposable (BlockContext bc, TypeSpec type)
+			{
+				var target = bc.BuiltinTypes.IDisposable;
+				var tp = type as TypeParameterSpec;
+				if (tp != null)
+					return Convert.ImplicitTypeParameterConversion (null, tp, target) != null;
 
-			ec.StartFlowBranching (this);
-
-			bool ok = Statement.Resolve (ec);
-
-			ec.EndFlowBranching ();
-
-			ok &= base.Resolve (ec);
-
-			if (TypeManager.void_dispose_void == null) {
-				TypeManager.void_dispose_void = TypeManager.GetPredefinedMethod (
-					TypeManager.idisposable_type, "Dispose", loc, Type.EmptyTypes);
+				return type.ImplementsInterface (target, false);
 			}
 
-			return ok;
-		}
+			protected virtual Statement CreateDisposeCall (BlockContext bc, LocalVariable lv)
+			{
+				var lvr = lv.CreateReferenceExpression (bc, lv.Location);
+				var type = lv.Type;
+				var loc = lv.Location;
 
-		protected override void EmitPreTryBody (EmitContext ec)
-		{
-			local_copy.EmitAssign (ec, expr);
-		}
+				var idt = bc.BuiltinTypes.IDisposable;
+				var m = bc.Module.PredefinedMembers.IDisposableDispose.Resolve (loc);
 
-		protected override void EmitTryBody (EmitContext ec)
-		{
-			Statement.Emit (ec);
-		}
+				var dispose_mg = MethodGroupExpr.CreatePredefined (m, idt, loc);
+				dispose_mg.InstanceExpression = type.IsNullableType ?
+					new Cast (new TypeExpression (idt, loc), lvr, loc).Resolve (bc) :
+					lvr;
 
-		public override void EmitFinallyBody (EmitContext ec)
-		{
-			ILGenerator ig = ec.ig;
-			if (!TypeManager.IsStruct (expr_type)) {
-				Label skip = ig.DefineLabel ();
-				local_copy.Emit (ec);
-				ig.Emit (OpCodes.Brfalse, skip);
-				local_copy.Emit (ec);
-				ig.Emit (OpCodes.Callvirt, TypeManager.void_dispose_void);
-				ig.MarkLabel (skip);
-				return;
+				//
+				// Hide it from symbol file via null location
+				//
+				Statement dispose = new StatementExpression (new Invocation (dispose_mg, null), Location.Null);
+
+				// Add conditional call when disposing possible null variable
+				if (!TypeSpec.IsValueType (type) || type.IsNullableType)
+					dispose = new If (new Binary (Binary.Operator.Inequality, lvr, new NullLiteral (loc)), dispose, dispose.loc);
+
+				return dispose;
 			}
 
-			Expression ml = Expression.MemberLookup (RootContext.ToplevelTypes.Compiler,
-				ec.CurrentType, TypeManager.idisposable_type, expr_type,
-				"Dispose", Location.Null);
-
-			if (!(ml is MethodGroupExpr)) {
-				local_copy.Emit (ec);
-				ig.Emit (OpCodes.Box, expr_type);
-				ig.Emit (OpCodes.Callvirt, TypeManager.void_dispose_void);
-				return;
+			public void ResolveDeclaratorInitializer (BlockContext bc)
+			{
+				Initializer = base.ResolveInitializer (bc, Variable, Initializer);
 			}
 
-			MethodInfo mi = null;
+			public Statement RewriteUsingDeclarators (BlockContext bc, Statement stmt)
+			{
+				for (int i = declarators.Count - 1; i >= 0; --i) {
+					var d = declarators [i];
+					var vd = new VariableDeclaration (d.Variable, d.Variable.Location);
+					vd.Initializer = d.Initializer;
+					vd.IsNested = true;
+					vd.dispose_call = CreateDisposeCall (bc, d.Variable);
+					vd.dispose_call.Resolve (bc);
 
-			foreach (MethodInfo mk in ((MethodGroupExpr) ml).Methods) {
-				if (TypeManager.GetParameterData (mk).Count == 0) {
-					mi = mk;
-					break;
+					stmt = new Using (vd, stmt, d.Variable.Location);
 				}
+
+				declarators = null;
+				return stmt;
+			}	
+
+			public override object Accept (StructuralVisitor visitor)
+			{
+				return visitor.Visit (this);
+			}	
+		}
+
+		VariableDeclaration decl;
+
+		public Using (VariableDeclaration decl, Statement stmt, Location loc)
+			: base (stmt, loc)
+		{
+			this.decl = decl;
+		}
+
+		public Using (Expression expr, Statement stmt, Location loc)
+			: base (stmt, loc)
+		{
+			this.decl = new VariableDeclaration (expr);
+		}
+
+		#region Properties
+
+		public Expression Expr {
+			get {
+				return decl.Variable == null ? decl.Initializer : null;
 			}
+		}
 
-			if (mi == null) {
-				RootContext.ToplevelTypes.Compiler.Report.Error(-100, Mono.CSharp.Location.Null, "Internal error: No Dispose method which takes 0 parameters.");
-				return;
+		public BlockVariable Variables {
+			get {
+				return decl;
 			}
-
-			local_copy.AddressOf (ec, AddressOp.Load);
-			ig.Emit (OpCodes.Call, mi);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		#endregion
+
+		public override void Emit (EmitContext ec)
 		{
-			expr_type = storey.MutateType (expr_type);
-			local_copy.MutateHoistedGenericType (storey);
-			Statement.MutateHoistedGenericType (storey);
+			//
+			// Don't emit sequence point it will be set on variable declaration
+			//
+			DoEmit (ec);
 		}
 
-		protected override void CloneTo (CloneContext clonectx, Statement t)
+		protected override void EmitTryBodyPrepare (EmitContext ec)
 		{
-			UsingTemporary target = (UsingTemporary) t;
-
-			target.expr = expr.Clone (clonectx);
-			target.Statement = Statement.Clone (clonectx);
-		}
-	}
-
-	public class Using : ExceptionStatement {
-		Statement stmt;
-		public Statement EmbeddedStatement {
-			get { return stmt is Using ? ((Using) stmt).EmbeddedStatement : stmt; }
-		}
-
-		Expression var;
-		Expression init;
-
-		ExpressionStatement assign;
-
-		public Using (Expression var, Expression init, Statement stmt, Location l)
-		{
-			this.var = var;
-			this.init = init;
-			this.stmt = stmt;
-			loc = l;
-		}
-
-		static public void Error_IsNotConvertibleToIDisposable (BlockContext ec, Expression expr)
-		{
-			ec.Report.SymbolRelatedToPreviousError (expr.Type);
-			ec.Report.Error (1674, expr.Location, "`{0}': type used in a using statement must be implicitly convertible to `System.IDisposable'",
-				expr.GetSignatureForError ());
-		}
-
-		protected override void EmitPreTryBody (EmitContext ec)
-		{
-			assign.EmitStatement (ec);
+			decl.Emit (ec);
+			base.EmitTryBodyPrepare (ec);
 		}
 
 		protected override void EmitTryBody (EmitContext ec)
@@ -5049,126 +7463,120 @@ namespace Mono.CSharp {
 
 		public override void EmitFinallyBody (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-			Label skip = ig.DefineLabel ();
-
-			bool emit_null_check = !TypeManager.IsValueType (var.Type);
-			if (emit_null_check) {
-				var.Emit (ec);
-				ig.Emit (OpCodes.Brfalse, skip);
-			}
-
-			Invocation.EmitCall (ec, false, var, TypeManager.void_dispose_void, null, loc);
-
-			if (emit_null_check)
-				ig.MarkLabel (skip);
+			decl.EmitDispose (ec);
 		}
 
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
 		{
-			assign.MutateHoistedGenericType (storey);
-			var.MutateHoistedGenericType (storey);
-			stmt.MutateHoistedGenericType (storey);
+			decl.FlowAnalysis (fc);
+			return stmt.FlowAnalysis (fc);
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			decl.MarkReachable (rc);
+			return base.MarkReachable (rc);
 		}
 
 		public override bool Resolve (BlockContext ec)
 		{
-			if (!ResolveVariable (ec))
-				return false;
+			VariableReference vr;
+			bool vr_locked = false;
 
-			ec.StartFlowBranching (this);
+			using (ec.Set (ResolveContext.Options.UsingInitializerScope)) {
+				if (decl.Variable == null) {
+					vr = decl.ResolveExpression (ec) as VariableReference;
+					if (vr != null) {
+						vr_locked = vr.IsLockedByStatement;
+						vr.IsLockedByStatement = true;
+					}
+				} else {
+					if (decl.IsNested) {
+						decl.ResolveDeclaratorInitializer (ec);
+					} else {
+						if (!decl.Resolve (ec))
+							return false;
 
-			bool ok = stmt.Resolve (ec);
+						if (decl.Declarators != null) {
+							stmt = decl.RewriteUsingDeclarators (ec, stmt);
+						}
+					}
 
-			ec.EndFlowBranching ();
-
-			ok &= base.Resolve (ec);
-
-			if (TypeManager.void_dispose_void == null) {
-				TypeManager.void_dispose_void = TypeManager.GetPredefinedMethod (
-					TypeManager.idisposable_type, "Dispose", loc, Type.EmptyTypes);
+					vr = null;
+				}
 			}
+
+			var ok = base.Resolve (ec);
+
+			if (vr != null)
+				vr.IsLockedByStatement = vr_locked;
 
 			return ok;
-		}
-
-		bool ResolveVariable (BlockContext ec)
-		{
-			assign = new SimpleAssign (var, init, loc);
-			assign = assign.ResolveStatement (ec);
-			if (assign == null)
-				return false;
-
-			if (assign.Type == TypeManager.idisposable_type ||
-				TypeManager.ImplementsInterface (assign.Type, TypeManager.idisposable_type)) {
-				return true;
-			}
-
-			Expression e = Convert.ImplicitConversionStandard (ec, assign, TypeManager.idisposable_type, var.Location);
-			if (e == null) {
-				Error_IsNotConvertibleToIDisposable (ec, var);
-				return false;
-			}
-
-			throw new NotImplementedException ("covariance?");
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
 		{
 			Using target = (Using) t;
 
-			target.var = var.Clone (clonectx);
-			target.init = init.Clone (clonectx);
+			target.decl = (VariableDeclaration) decl.Clone (clonectx);
 			target.stmt = stmt.Clone (clonectx);
+		}
+
+		public override object Accept (StructuralVisitor visitor)
+		{
+			return visitor.Visit (this);
 		}
 	}
 
 	/// <summary>
 	///   Implementation of the foreach C# statement
 	/// </summary>
-	public class Foreach : Statement {
-
-		sealed class ArrayForeach : Statement
+	public class Foreach : LoopStatement
+	{
+		abstract class IteratorStatement : Statement
 		{
-			class ArrayCounter : TemporaryVariable
+			protected readonly Foreach for_each;
+
+			protected IteratorStatement (Foreach @foreach)
 			{
-				StatementExpression increment;
-
-				public ArrayCounter (Location loc)
-					: base (TypeManager.int32_type, loc)
-				{
-				}
-
-				public void ResolveIncrement (BlockContext ec)
-				{
-					increment = new StatementExpression (new UnaryMutator (UnaryMutator.Mode.PostIncrement, this));
-					increment.Resolve (ec);
-				}
-
-				public void EmitIncrement (EmitContext ec)
-				{
-					increment.Emit (ec);
-				}
+				this.for_each = @foreach;
+				this.loc = @foreach.expr.Location;
 			}
 
-			readonly Foreach for_each;
-			readonly Statement statement;
+			protected override void CloneTo (CloneContext clonectx, Statement target)
+			{
+				throw new NotImplementedException ();
+			}
 
-			Expression conv;
-			TemporaryVariable[] lengths;
+			public override void Emit (EmitContext ec)
+			{
+				if (ec.EmitAccurateDebugInfo) {
+					ec.Emit (OpCodes.Nop);
+				}
+
+				base.Emit (ec);
+			}
+
+			protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+			{
+				throw new NotImplementedException ();
+			}
+		}
+
+		sealed class ArrayForeach : IteratorStatement
+		{
+			TemporaryVariableReference[] lengths;
 			Expression [] length_exprs;
-			ArrayCounter[] counter;
+			StatementExpression[] counter;
+			TemporaryVariableReference[] variables;
 
-			TemporaryVariable copy;
-			Expression access;
+			TemporaryVariableReference copy;
 
 			public ArrayForeach (Foreach @foreach, int rank)
+				: base (@foreach)
 			{
-				for_each = @foreach;
-				statement = for_each.statement;
-				loc = @foreach.loc;
-
-				counter = new ArrayCounter [rank];
+				counter = new StatementExpression[rank];
+				variables = new TemporaryVariableReference[rank];
 				length_exprs = new Expression [rank];
 
 				//
@@ -5176,84 +7584,69 @@ namespace Mono.CSharp {
 				// multi-dimensional arrays
 				//
 				if (rank > 1)
-					lengths = new TemporaryVariable [rank];
-			}
-
-			protected override void CloneTo (CloneContext clonectx, Statement target)
-			{
-				throw new NotImplementedException ();
+					lengths = new TemporaryVariableReference [rank];
 			}
 
 			public override bool Resolve (BlockContext ec)
 			{
-				copy = new TemporaryVariable (for_each.expr.Type, loc);
+				Block variables_block = for_each.variable.Block;
+				copy = TemporaryVariableReference.Create (for_each.expr.Type, variables_block, loc);
 				copy.Resolve (ec);
 
 				int rank = length_exprs.Length;
 				Arguments list = new Arguments (rank);
 				for (int i = 0; i < rank; i++) {
-					counter [i] = new ArrayCounter (loc);
-					counter [i].ResolveIncrement (ec);					
+					var v = TemporaryVariableReference.Create (ec.BuiltinTypes.Int, variables_block, loc);
+					variables[i] = v;
+					counter[i] = new StatementExpression (new UnaryMutator (UnaryMutator.Mode.PostIncrement, v, Location.Null));
+					counter[i].Resolve (ec);
 
 					if (rank == 1) {
 						length_exprs [i] = new MemberAccess (copy, "Length").Resolve (ec);
 					} else {
-						lengths [i] = new TemporaryVariable (TypeManager.int32_type, loc);
-						lengths [i].Resolve (ec);
+						lengths[i] = TemporaryVariableReference.Create (ec.BuiltinTypes.Int, variables_block, loc);
+						lengths[i].Resolve (ec);
 
 						Arguments args = new Arguments (1);
-						args.Add (new Argument (new IntConstant (i, loc)));
+						args.Add (new Argument (new IntConstant (ec.BuiltinTypes, i, loc)));
 						length_exprs [i] = new Invocation (new MemberAccess (copy, "GetLength"), args).Resolve (ec);
 					}
 
-					list.Add (new Argument (counter [i]));
+					list.Add (new Argument (v));
 				}
 
-				access = new ElementAccess (copy, list).Resolve (ec);
+				var access = new ElementAccess (copy, list, loc).Resolve (ec);
 				if (access == null)
 					return false;
 
-				Expression var_type = for_each.type;
-				VarExpr ve = var_type as VarExpr;
-				if (ve != null) {
+				TypeSpec var_type;
+				if (for_each.type is VarExpr) {
 					// Infer implicitly typed local variable from foreach array type
-					var_type = new TypeExpression (access.Type, ve.Location);
+					var_type = access.Type;
+				} else {
+					var_type = for_each.type.ResolveAsType (ec);
+
+					if (var_type == null)
+						return false;
+
+					access = Convert.ExplicitConversion (ec, access, var_type, loc);
+					if (access == null)
+						return false;
 				}
 
-				var_type = var_type.ResolveAsTypeTerminal (ec, false);
-				if (var_type == null)
+				for_each.variable.Type = var_type;
+
+				var variable_ref = new LocalVariableReference (for_each.variable, loc).Resolve (ec);
+				if (variable_ref == null)
 					return false;
 
-				conv = Convert.ExplicitConversion (ec, access, var_type.Type, loc);
-				if (conv == null)
-					return false;
+				for_each.body.AddScopeStatement (new StatementExpression (new CompilerAssign (variable_ref, access, Location.Null), for_each.type.Location));
 
-				bool ok = true;
-
-				ec.StartFlowBranching (FlowBranching.BranchingType.Loop, loc);
-				ec.CurrentBranching.CreateSibling ();
-
-				for_each.variable = for_each.variable.ResolveLValue (ec, conv);
-				if (for_each.variable == null)
-					ok = false;
-
-				ec.StartFlowBranching (FlowBranching.BranchingType.Embedded, loc);
-				if (!statement.Resolve (ec))
-					ok = false;
-				ec.EndFlowBranching ();
-
-				// There's no direct control flow from the end of the embedded statement to the end of the loop
-				ec.CurrentBranching.CurrentUsageVector.Goto ();
-
-				ec.EndFlowBranching ();
-
-				return ok;
+				return for_each.body.Resolve (ec);
 			}
 
 			protected override void DoEmit (EmitContext ec)
 			{
-				ILGenerator ig = ec.ig;
-
 				copy.EmitAssign (ec, for_each.expr);
 
 				int rank = length_exprs.Length;
@@ -5261,606 +7654,396 @@ namespace Mono.CSharp {
 				Label[] loop = new Label [rank];
 
 				for (int i = 0; i < rank; i++) {
-					test [i] = ig.DefineLabel ();
-					loop [i] = ig.DefineLabel ();
+					test [i] = ec.DefineLabel ();
+					loop [i] = ec.DefineLabel ();
 
 					if (lengths != null)
 						lengths [i].EmitAssign (ec, length_exprs [i]);
 				}
 
-				IntConstant zero = new IntConstant (0, loc);
+				IntConstant zero = new IntConstant (ec.BuiltinTypes, 0, loc);
 				for (int i = 0; i < rank; i++) {
-					counter [i].EmitAssign (ec, zero);
+					variables [i].EmitAssign (ec, zero);
 
-					ig.Emit (OpCodes.Br, test [i]);
-					ig.MarkLabel (loop [i]);
+					ec.Emit (OpCodes.Br, test [i]);
+					ec.MarkLabel (loop [i]);
 				}
 
-				((IAssignMethod) for_each.variable).EmitAssign (ec, conv, false, false);
+				for_each.body.Emit (ec);
 
-				statement.Emit (ec);
-
-				ig.MarkLabel (ec.LoopBegin);
+				ec.MarkLabel (ec.LoopBegin);
+				ec.Mark (for_each.expr.Location);
 
 				for (int i = rank - 1; i >= 0; i--){
-					counter [i].EmitIncrement (ec);
-
-					ig.MarkLabel (test [i]);
 					counter [i].Emit (ec);
+
+					ec.MarkLabel (test [i]);
+					variables [i].Emit (ec);
 
 					if (lengths != null)
 						lengths [i].Emit (ec);
 					else
 						length_exprs [i].Emit (ec);
 
-					ig.Emit (OpCodes.Blt, loop [i]);
+					ec.Emit (OpCodes.Blt, loop [i]);
 				}
 
-				ig.MarkLabel (ec.LoopEnd);
-			}
-
-			public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-			{
-				for_each.expr.MutateHoistedGenericType (storey);
-
-				copy.MutateHoistedGenericType (storey);
-				conv.MutateHoistedGenericType (storey);
-				statement.MutateHoistedGenericType (storey);
-
-				for (int i = 0; i < counter.Length; i++) {
-					counter [i].MutateHoistedGenericType (storey);
-					if (lengths != null)
-						lengths [i].MutateHoistedGenericType (storey);
-				}
+				ec.MarkLabel (ec.LoopEnd);
 			}
 		}
 
-		sealed class CollectionForeach : Statement
+		sealed class CollectionForeach : IteratorStatement, OverloadResolver.IErrorHandler
 		{
-			class CollectionForeachStatement : Statement
+			class RuntimeDispose : Using.VariableDeclaration
 			{
-				Type type;
-				Expression variable, current, conv;
-				Statement statement;
-				Assign assign;
-
-				public CollectionForeachStatement (Type type, Expression variable,
-								   Expression current, Statement statement,
-								   Location loc)
+				public RuntimeDispose (LocalVariable lv, Location loc)
+					: base (lv, loc)
 				{
-					this.type = type;
-					this.variable = variable;
-					this.current = current;
-					this.statement = statement;
-					this.loc = loc;
+					reachable = true;
 				}
 
-				protected override void CloneTo (CloneContext clonectx, Statement target)
+				protected override void CheckIDiposableConversion (BlockContext bc, LocalVariable li, Expression initializer)
 				{
-					throw new NotImplementedException ();
+					// Defered to runtime check
 				}
 
-				public override bool Resolve (BlockContext ec)
+				protected override Statement CreateDisposeCall (BlockContext bc, LocalVariable lv)
 				{
-					current = current.Resolve (ec);
-					if (current == null)
-						return false;
+					var idt = bc.BuiltinTypes.IDisposable;
 
-					conv = Convert.ExplicitConversion (ec, current, type, loc);
-					if (conv == null)
-						return false;
+					//
+					// Fabricates code like
+					//
+					// if ((temp = vr as IDisposable) != null) temp.Dispose ();
+					//
 
-					assign = new SimpleAssign (variable, conv, loc);
-					if (assign.Resolve (ec) == null)
-						return false;
+					var dispose_variable = LocalVariable.CreateCompilerGenerated (idt, bc.CurrentBlock, loc);
 
-					if (!statement.Resolve (ec))
-						return false;
+					var idisaposable_test = new Binary (Binary.Operator.Inequality, new CompilerAssign (
+						dispose_variable.CreateReferenceExpression (bc, loc),
+						new As (lv.CreateReferenceExpression (bc, loc), new TypeExpression (dispose_variable.Type, loc), loc),
+						loc), new NullLiteral (loc));
 
-					return true;
-				}
+					var m = bc.Module.PredefinedMembers.IDisposableDispose.Resolve (loc);
 
-				protected override void DoEmit (EmitContext ec)
-				{
-					assign.EmitStatement (ec);
-					statement.Emit (ec);
-				}
+					var dispose_mg = MethodGroupExpr.CreatePredefined (m, idt, loc);
+					dispose_mg.InstanceExpression = dispose_variable.CreateReferenceExpression (bc, loc);
 
-				public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-				{
-					assign.MutateHoistedGenericType (storey);
-					statement.MutateHoistedGenericType (storey);
+					Statement dispose = new StatementExpression (new Invocation (dispose_mg, null));
+					return new If (idisaposable_test, dispose, loc);
 				}
 			}
 
-			Expression variable, expr;
+			LocalVariable variable;
+			Expression expr;
 			Statement statement;
+			ExpressionStatement init;
+			TemporaryVariableReference enumerator_variable;
+			bool ambiguous_getenumerator_name;
 
-			TemporaryVariable enumerator;
-			Expression init;
-			Statement loop;
-			Statement wrapper;
-
-			MethodGroupExpr get_enumerator;
-			PropertyExpr get_current;
-			MethodInfo move_next;
-			Expression var_type;
-			Type enumerator_type;
-			bool enumerator_found;
-
-			public CollectionForeach (Expression var_type, Expression var,
-						  Expression expr, Statement stmt, Location l)
+			public CollectionForeach (Foreach @foreach, LocalVariable var, Expression expr)
+				: base (@foreach)
 			{
-				this.var_type = var_type;
 				this.variable = var;
 				this.expr = expr;
-				statement = stmt;
-				loc = l;
 			}
 
-			protected override void CloneTo (CloneContext clonectx, Statement target)
+			void Error_WrongEnumerator (ResolveContext rc, MethodSpec enumerator)
 			{
-				throw new NotImplementedException ();
+				rc.Report.SymbolRelatedToPreviousError (enumerator);
+				rc.Report.Error (202, loc,
+					"foreach statement requires that the return type `{0}' of `{1}' must have a suitable public MoveNext method and public Current property",
+						enumerator.ReturnType.GetSignatureForError (), enumerator.GetSignatureForError ());
 			}
 
-			bool GetEnumeratorFilter (ResolveContext ec, MethodInfo mi)
+			MethodGroupExpr ResolveGetEnumerator (ResolveContext rc)
 			{
-				Type return_type = mi.ReturnType;
+				//
+				// Option 1: Try to match by name GetEnumerator first
+				//
+				var mexpr = Expression.MemberLookup (rc, false, expr.Type,
+					"GetEnumerator", 0, Expression.MemberLookupRestrictions.ExactArity, loc);		// TODO: What if CS0229 ?
+
+				var mg = mexpr as MethodGroupExpr;
+				if (mg != null) {
+					mg.InstanceExpression = expr;
+					Arguments args = new Arguments (0);
+					mg = mg.OverloadResolve (rc, ref args, this, OverloadResolver.Restrictions.ProbingOnly | OverloadResolver.Restrictions.GetEnumeratorLookup);
+
+					// For ambiguous GetEnumerator name warning CS0278 was reported, but Option 2 could still apply
+					if (ambiguous_getenumerator_name)
+						mg = null;
+
+					if (mg != null && !mg.BestCandidate.IsStatic && mg.BestCandidate.IsPublic) {
+						return mg;
+					}
+				}
 
 				//
-				// Ok, we can access it, now make sure that we can do something
-				// with this `GetEnumerator'
+				// Option 2: Try to match using IEnumerable interfaces with preference of generic version
 				//
+				var t = expr.Type;
+				PredefinedMember<MethodSpec> iface_candidate = null;
+				var ptypes = rc.Module.PredefinedTypes;
+				var gen_ienumerable = ptypes.IEnumerableGeneric;
+				if (!gen_ienumerable.Define ())
+					gen_ienumerable = null;
 
-				if (return_type == TypeManager.ienumerator_type ||
-					TypeManager.ImplementsInterface (return_type, TypeManager.ienumerator_type)) {
-					//
-					// If it is not an interface, lets try to find the methods ourselves.
-					// For example, if we have:
-					// public class Foo : IEnumerator { public bool MoveNext () {} public int Current { get {}}}
-					// We can avoid the iface call. This is a runtime perf boost.
-					// even bigger if we have a ValueType, because we avoid the cost
-					// of boxing.
-					//
-					// We have to make sure that both methods exist for us to take
-					// this path. If one of the methods does not exist, we will just
-					// use the interface. Sadly, this complex if statement is the only
-					// way I could do this without a goto
-					//
+				var ifaces = t.Interfaces;
+				if (ifaces != null) {
+					foreach (var iface in ifaces) {
+						if (gen_ienumerable != null && iface.MemberDefinition == gen_ienumerable.TypeSpec.MemberDefinition) {
+							if (iface_candidate != null && iface_candidate != rc.Module.PredefinedMembers.IEnumerableGetEnumerator) {
+								rc.Report.SymbolRelatedToPreviousError (expr.Type);
+								rc.Report.Error (1640, loc,
+									"foreach statement cannot operate on variables of type `{0}' because it contains multiple implementation of `{1}'. Try casting to a specific implementation",
+									expr.Type.GetSignatureForError (), gen_ienumerable.TypeSpec.GetSignatureForError ());
 
-					if (TypeManager.bool_movenext_void == null) {
-						TypeManager.bool_movenext_void = TypeManager.GetPredefinedMethod (
-							TypeManager.ienumerator_type, "MoveNext", loc, Type.EmptyTypes);
-					}
+								return null;
+							}
 
-					if (TypeManager.ienumerator_getcurrent == null) {
-						TypeManager.ienumerator_getcurrent = TypeManager.GetPredefinedProperty (
-							TypeManager.ienumerator_type, "Current", loc, TypeManager.object_type);
-					}
+							// TODO: Cache this somehow
+							iface_candidate = new PredefinedMember<MethodSpec> (rc.Module, iface,
+								MemberFilter.Method ("GetEnumerator", 0, ParametersCompiled.EmptyReadOnlyParameters, null));
 
-					//
-					// Prefer a generic enumerator over a non-generic one.
-					//
-					if (return_type.IsInterface && TypeManager.IsGenericType (return_type)) {
-						enumerator_type = return_type;
-						if (!FetchGetCurrent (ec, return_type))
-							get_current = new PropertyExpr (
-								ec.CurrentType, TypeManager.ienumerator_getcurrent, loc);
-						if (!FetchMoveNext (return_type))
-							move_next = TypeManager.bool_movenext_void;
-						return true;
-					}
-
-					if (return_type.IsInterface ||
-					    !FetchMoveNext (return_type) ||
-					    !FetchGetCurrent (ec, return_type)) {
-						enumerator_type = return_type;
-						move_next = TypeManager.bool_movenext_void;
-						get_current = new PropertyExpr (
-							ec.CurrentType, TypeManager.ienumerator_getcurrent, loc);
-						return true;
-					}
-				} else {
-					//
-					// Ok, so they dont return an IEnumerable, we will have to
-					// find if they support the GetEnumerator pattern.
-					//
-
-					if (TypeManager.HasElementType (return_type) || !FetchMoveNext (return_type) || !FetchGetCurrent (ec, return_type)) {
-						ec.Report.Error (202, loc, "foreach statement requires that the return type `{0}' of `{1}' must have a suitable public MoveNext method and public Current property",
-							TypeManager.CSharpName (return_type), TypeManager.CSharpSignature (mi));
-						return false;
-					}
-				}
-
-				enumerator_type = return_type;
-
-				return true;
-			}
-
-			//
-			// Retrieves a `public bool MoveNext ()' method from the Type `t'
-			//
-			bool FetchMoveNext (Type t)
-			{
-				MemberInfo[] move_next_list = TypeManager.MemberLookup (null, null, t,
-					MemberTypes.Method,
-					BindingFlags.Public | BindingFlags.Instance,
-					"MoveNext", null);
-
-				if (move_next_list == null)
-					return false;
-
-				foreach (MemberInfo m in move_next_list){
-					MethodInfo mi = (MethodInfo) m;
-				
-					if ((TypeManager.GetParameterData (mi).Count == 0) &&
-					    TypeManager.TypeToCoreType (mi.ReturnType) == TypeManager.bool_type) {
-						move_next = mi;
-						return true;
-					}
-				}
-
-				return false;
-			}
-		
-			//
-			// Retrieves a `public T get_Current ()' method from the Type `t'
-			//
-			bool FetchGetCurrent (ResolveContext ec, Type t)
-			{
-				PropertyExpr pe = Expression.MemberLookup (ec.Compiler,
-					ec.CurrentType, t, "Current", MemberTypes.Property,
-					Expression.AllBindingFlags, loc) as PropertyExpr;
-				if (pe == null)
-					return false;
-
-				get_current = pe;
-				return true;
-			}
-
-			void Error_Enumerator (BlockContext ec)
-			{
-				if (enumerator_found) {
-					return;
-				}
-
-			    ec.Report.Error (1579, loc,
-					"foreach statement cannot operate on variables of type `{0}' because it does not contain a definition for `GetEnumerator' or is not accessible",
-					TypeManager.CSharpName (expr.Type));
-			}
-
-			bool IsOverride (MethodInfo m)
-			{
-				m = (MethodInfo) TypeManager.DropGenericMethodArguments (m);
-
-				if (!m.IsVirtual || ((m.Attributes & MethodAttributes.NewSlot) != 0))
-					return false;
-				if (m is MethodBuilder)
-					return true;
-
-				MethodInfo base_method = m.GetBaseDefinition ();
-				return base_method != m;
-			}
-
-			bool TryType (ResolveContext ec, Type t)
-			{
-				MethodGroupExpr mg = Expression.MemberLookup (ec.Compiler,
-					ec.CurrentType, t, "GetEnumerator", MemberTypes.Method,
-					Expression.AllBindingFlags, loc) as MethodGroupExpr;
-				if (mg == null)
-					return false;
-
-				MethodInfo result = null;
-				MethodInfo tmp_move_next = null;
-				PropertyExpr tmp_get_cur = null;
-				Type tmp_enumerator_type = enumerator_type;
-				foreach (MethodInfo mi in mg.Methods) {
-					if (TypeManager.GetParameterData (mi).Count != 0)
-						continue;
-			
-					// Check whether GetEnumerator is public
-					if ((mi.Attributes & MethodAttributes.Public) != MethodAttributes.Public)
-						continue;
-
-					if (IsOverride (mi))
-						continue;
-
-					enumerator_found = true;
-
-					if (!GetEnumeratorFilter (ec, mi))
-						continue;
-
-					if (result != null) {
-						if (TypeManager.IsGenericType (result.ReturnType)) {
-							if (!TypeManager.IsGenericType (mi.ReturnType))
-								continue;
-
-							MethodBase mb = TypeManager.DropGenericMethodArguments (mi);
-							ec.Report.SymbolRelatedToPreviousError (t);
-							ec.Report.Error(1640, loc, "foreach statement cannot operate on variables of type `{0}' " +
-								     "because it contains multiple implementation of `{1}'. Try casting to a specific implementation",
-								     TypeManager.CSharpName (t), TypeManager.CSharpSignature (mb));
-							return false;
+							continue;
 						}
 
-						// Always prefer generics enumerators
-						if (!TypeManager.IsGenericType (mi.ReturnType)) {
-							if (TypeManager.ImplementsInterface (mi.DeclaringType, result.DeclaringType) ||
-							    TypeManager.ImplementsInterface (result.DeclaringType, mi.DeclaringType))
-								continue;
-
-							ec.Report.SymbolRelatedToPreviousError (result);
-							ec.Report.SymbolRelatedToPreviousError (mi);
-							ec.Report.Warning (278, 2, loc, "`{0}' contains ambiguous implementation of `{1}' pattern. Method `{2}' is ambiguous with method `{3}'",
-									TypeManager.CSharpName (t), "enumerable", TypeManager.CSharpSignature (result), TypeManager.CSharpSignature (mi));
-							return false;
+						if (iface.BuiltinType == BuiltinTypeSpec.Type.IEnumerable && iface_candidate == null) {
+							iface_candidate = rc.Module.PredefinedMembers.IEnumerableGetEnumerator;
 						}
 					}
-					result = mi;
-					tmp_move_next = move_next;
-					tmp_get_cur = get_current;
-					tmp_enumerator_type = enumerator_type;
-					if (mi.DeclaringType == t)
-						break;
 				}
 
-				if (result != null) {
-					move_next = tmp_move_next;
-					get_current = tmp_get_cur;
-					enumerator_type = tmp_enumerator_type;
-					MethodInfo[] mi = new MethodInfo[] { (MethodInfo) result };
-					get_enumerator = new MethodGroupExpr (mi, enumerator_type, loc);
-
-					if (t != expr.Type) {
-						expr = Convert.ExplicitConversion (
-							ec, expr, t, loc);
-						if (expr == null)
-							throw new InternalErrorException ();
+				if (iface_candidate == null) {
+					if (expr.Type != InternalType.ErrorType) {
+						rc.Report.Error (1579, loc,
+							"foreach statement cannot operate on variables of type `{0}' because it does not contain a definition for `{1}' or is inaccessible",
+							expr.Type.GetSignatureForError (), "GetEnumerator");
 					}
 
-					get_enumerator.InstanceExpression = expr;
-					get_enumerator.IsBase = t != expr.Type;
-
-					return true;
+					return null;
 				}
 
-				return false;
+				var method = iface_candidate.Resolve (loc);
+				if (method == null)
+					return null;
+
+				mg = MethodGroupExpr.CreatePredefined (method, expr.Type, loc);
+				mg.InstanceExpression = expr;
+				return mg;
 			}
 
-			bool ProbeCollectionType (ResolveContext ec, Type t)
+			MethodGroupExpr ResolveMoveNext (ResolveContext rc, MethodSpec enumerator)
 			{
-				int errors = ec.Report.Errors;
-				for (Type tt = t; tt != null && tt != TypeManager.object_type;){
-					if (TryType (ec, tt))
-						return true;
-					tt = tt.BaseType;
+				var ms = MemberCache.FindMember (enumerator.ReturnType,
+					MemberFilter.Method ("MoveNext", 0, ParametersCompiled.EmptyReadOnlyParameters, rc.BuiltinTypes.Bool),
+					BindingRestriction.InstanceOnly) as MethodSpec;
+
+				if (ms == null || !ms.IsPublic) {
+					Error_WrongEnumerator (rc, enumerator);
+					return null;
 				}
 
-				if (ec.Report.Errors > errors)
-					return false;
+				return MethodGroupExpr.CreatePredefined (ms, enumerator.ReturnType, expr.Location);
+			}
 
-				//
-				// Now try to find the method in the interfaces
-				//
-				Type [] ifaces = TypeManager.GetInterfaces (t);
-				foreach (Type i in ifaces){
-					if (TryType (ec, i))
-						return true;
+			PropertySpec ResolveCurrent (ResolveContext rc, MethodSpec enumerator)
+			{
+				var ps = MemberCache.FindMember (enumerator.ReturnType,
+					MemberFilter.Property ("Current", null),
+					BindingRestriction.InstanceOnly) as PropertySpec;
+
+				if (ps == null || !ps.IsPublic) {
+					Error_WrongEnumerator (rc, enumerator);
+					return null;
 				}
 
-				return false;
+				return ps;
 			}
 
 			public override bool Resolve (BlockContext ec)
 			{
-				enumerator_type = TypeManager.ienumerator_type;
+				bool is_dynamic = expr.Type.BuiltinType == BuiltinTypeSpec.Type.Dynamic;
 
-				if (!ProbeCollectionType (ec, expr.Type)) {
-					Error_Enumerator (ec);
+				if (is_dynamic) {
+					expr = Convert.ImplicitConversionRequired (ec, expr, ec.BuiltinTypes.IEnumerable, loc);
+				} else if (expr.Type.IsNullableType) {
+					expr = new Nullable.UnwrapCall (expr).Resolve (ec);
+				}
+
+				var get_enumerator_mg = ResolveGetEnumerator (ec);
+				if (get_enumerator_mg == null) {
 					return false;
 				}
 
-				VarExpr ve = var_type as VarExpr;
+				var get_enumerator = get_enumerator_mg.BestCandidate;
+				enumerator_variable = TemporaryVariableReference.Create (get_enumerator.ReturnType, variable.Block, loc);
+				enumerator_variable.Resolve (ec);
+
+				// Prepare bool MoveNext ()
+				var move_next_mg = ResolveMoveNext (ec, get_enumerator);
+				if (move_next_mg == null) {
+					return false;
+				}
+
+				move_next_mg.InstanceExpression = enumerator_variable;
+
+				// Prepare ~T~ Current { get; }
+				var current_prop = ResolveCurrent (ec, get_enumerator);
+				if (current_prop == null) {
+					return false;
+				}
+
+				var current_pe = new PropertyExpr (current_prop, loc) { InstanceExpression = enumerator_variable }.Resolve (ec);
+				if (current_pe == null)
+					return false;
+
+				VarExpr ve = for_each.type as VarExpr;
+
 				if (ve != null) {
-					// Infer implicitly typed local variable from foreach enumerable type
-					var_type = new TypeExpression (get_current.PropertyInfo.PropertyType, var_type.Location);
-				}
-
-				var_type = var_type.ResolveAsTypeTerminal (ec, false);
-				if (var_type == null)
-					return false;
-								
-				enumerator = new TemporaryVariable (enumerator_type, loc);
-				enumerator.Resolve (ec);
-
-				init = new Invocation (get_enumerator, null);
-				init = init.Resolve (ec);
-				if (init == null)
-					return false;
-
-				Expression move_next_expr;
-				{
-					MemberInfo[] mi = new MemberInfo[] { move_next };
-					MethodGroupExpr mg = new MethodGroupExpr (mi, var_type.Type, loc);
-					mg.InstanceExpression = enumerator;
-
-					move_next_expr = new Invocation (mg, null);
-				}
-
-				get_current.InstanceExpression = enumerator;
-
-				Statement block = new CollectionForeachStatement (
-					var_type.Type, variable, get_current, statement, loc);
-
-				loop = new While (move_next_expr, block, loc);
-
-
-				bool implements_idisposable = TypeManager.ImplementsInterface (enumerator_type, TypeManager.idisposable_type);
-				if (implements_idisposable || !enumerator_type.IsSealed) {
-					wrapper = new DisposableWrapper (this, implements_idisposable);
+					if (is_dynamic) {
+						// Source type is dynamic, set element type to dynamic too
+						variable.Type = ec.BuiltinTypes.Dynamic;
+					} else {
+						// Infer implicitly typed local variable from foreach enumerable type
+						variable.Type = current_pe.Type;
+					}
 				} else {
-					wrapper = new NonDisposableWrapper (this);
+					if (is_dynamic) {
+						// Explicit cast of dynamic collection elements has to be done at runtime
+						current_pe = EmptyCast.Create (current_pe, ec.BuiltinTypes.Dynamic);
+					}
+
+					variable.Type = for_each.type.ResolveAsType (ec);
+
+					if (variable.Type == null)
+						return false;
+
+					current_pe = Convert.ExplicitConversion (ec, current_pe, variable.Type, loc);
+					if (current_pe == null)
+						return false;
 				}
 
-				return wrapper.Resolve (ec);
+				var variable_ref = new LocalVariableReference (variable, loc).Resolve (ec);
+				if (variable_ref == null)
+					return false;
+
+				for_each.body.AddScopeStatement (new StatementExpression (new CompilerAssign (variable_ref, current_pe, Location.Null), for_each.type.Location));
+
+				var init = new Invocation.Predefined (get_enumerator_mg, null);
+
+				statement = new While (new BooleanExpression (new Invocation (move_next_mg, null)),
+					 for_each.body, Location.Null);
+
+				var enum_type = enumerator_variable.Type;
+
+				//
+				// Add Dispose method call when enumerator can be IDisposable
+				//
+				if (!enum_type.ImplementsInterface (ec.BuiltinTypes.IDisposable, false)) {
+					if (!enum_type.IsSealed && !TypeSpec.IsValueType (enum_type)) {
+						//
+						// Runtime Dispose check
+						//
+						var vd = new RuntimeDispose (enumerator_variable.LocalInfo, Location.Null);
+						vd.Initializer = init;
+						statement = new Using (vd, statement, Location.Null);
+					} else {
+						//
+						// No Dispose call needed
+						//
+						this.init = new SimpleAssign (enumerator_variable, init, Location.Null);
+						this.init.Resolve (ec);
+					}
+				} else {
+					//
+					// Static Dispose check
+					//
+					var vd = new Using.VariableDeclaration (enumerator_variable.LocalInfo, Location.Null);
+					vd.Initializer = init;
+					statement = new Using (vd, statement, Location.Null);
+				}
+
+				return statement.Resolve (ec);
 			}
 
 			protected override void DoEmit (EmitContext ec)
 			{
-				wrapper.Emit (ec);
+				enumerator_variable.LocalInfo.CreateBuilder (ec);
+
+				if (init != null)
+					init.EmitStatement (ec);
+
+				statement.Emit (ec);
 			}
 
-			class NonDisposableWrapper : Statement {
-				CollectionForeach parent;
+			#region IErrorHandler Members
 
-				internal NonDisposableWrapper (CollectionForeach parent)
-				{
-					this.parent = parent;
-				}
-
-				protected override void CloneTo (CloneContext clonectx, Statement target)
-				{
-					throw new NotSupportedException ();
-				}
-
-				public override bool Resolve (BlockContext ec)
-				{
-					return parent.ResolveLoop (ec);
-				}
-
-				protected override void DoEmit (EmitContext ec)
-				{
-					parent.EmitLoopInit (ec);
-					parent.EmitLoopBody (ec);
-				}
-
-				public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-				{
-					throw new NotSupportedException ();
-				}
-			}
-
-			sealed class DisposableWrapper : ExceptionStatement
+			bool OverloadResolver.IErrorHandler.AmbiguousCandidates (ResolveContext ec, MemberSpec best, MemberSpec ambiguous)
 			{
-				CollectionForeach parent;
-				bool implements_idisposable;
+				ec.Report.SymbolRelatedToPreviousError (best);
+				ec.Report.Warning (278, 2, expr.Location,
+					"`{0}' contains ambiguous implementation of `{1}' pattern. Method `{2}' is ambiguous with method `{3}'",
+					expr.Type.GetSignatureForError (), "enumerable",
+					best.GetSignatureForError (), ambiguous.GetSignatureForError ());
 
-				internal DisposableWrapper (CollectionForeach parent, bool implements)
-				{
-					this.parent = parent;
-					this.implements_idisposable = implements;
-				}
-
-				protected override void CloneTo (CloneContext clonectx, Statement target)
-				{
-					throw new NotSupportedException ();
-				}
-
-				public override bool Resolve (BlockContext ec)
-				{
-					bool ok = true;
-
-					ec.StartFlowBranching (this);
-
-					if (!parent.ResolveLoop (ec))
-						ok = false;
-
-					ec.EndFlowBranching ();
-
-					ok &= base.Resolve (ec);
-
-					if (TypeManager.void_dispose_void == null) {
-						TypeManager.void_dispose_void = TypeManager.GetPredefinedMethod (
-							TypeManager.idisposable_type, "Dispose", loc, Type.EmptyTypes);
-					}
-					return ok;
-				}
-
-				protected override void EmitPreTryBody (EmitContext ec)
-				{
-					parent.EmitLoopInit (ec);
-				}
-
-				protected override void EmitTryBody (EmitContext ec)
-				{
-					parent.EmitLoopBody (ec);
-				}
-
-				public override void EmitFinallyBody (EmitContext ec)
-				{
-					Expression instance = parent.enumerator;
-					if (!TypeManager.IsValueType (parent.enumerator_type)) {
-						ILGenerator ig = ec.ig;
-
-						parent.enumerator.Emit (ec);
-
-						Label call_dispose = ig.DefineLabel ();
-
-						if (!implements_idisposable) {
-							ec.ig.Emit (OpCodes.Isinst, TypeManager.idisposable_type);
-							LocalTemporary temp = new LocalTemporary (TypeManager.idisposable_type);
-							temp.Store (ec);
-							temp.Emit (ec);
-							instance = temp;
-						}
-						
-						ig.Emit (OpCodes.Brtrue_S, call_dispose);
-
-						// using 'endfinally' to empty the evaluation stack
-						ig.Emit (OpCodes.Endfinally);
-						ig.MarkLabel (call_dispose);
-					}
-
-					Invocation.EmitCall (ec, false, instance, TypeManager.void_dispose_void, null, loc);
-				}
-
-				public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-				{
-					throw new NotSupportedException ();
-				}
+				ambiguous_getenumerator_name = true;
+				return true;
 			}
 
-			bool ResolveLoop (BlockContext ec)
+			bool OverloadResolver.IErrorHandler.ArgumentMismatch (ResolveContext rc, MemberSpec best, Argument arg, int index)
 			{
-				return loop.Resolve (ec);
+				return false;
 			}
 
-			void EmitLoopInit (EmitContext ec)
+			bool OverloadResolver.IErrorHandler.NoArgumentMatch (ResolveContext rc, MemberSpec best)
 			{
-				enumerator.EmitAssign (ec, init);
+				return false;
 			}
 
-			void EmitLoopBody (EmitContext ec)
+			bool OverloadResolver.IErrorHandler.TypeInferenceFailed (ResolveContext rc, MemberSpec best)
 			{
-				loop.Emit (ec);
+				return false;
 			}
 
-			public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
-			{
-				enumerator_type = storey.MutateType (enumerator_type);
-				init.MutateHoistedGenericType (storey);
-				loop.MutateHoistedGenericType (storey);
-			}
+			#endregion
 		}
 
 		Expression type;
-		Expression variable;
+		LocalVariable variable;
 		Expression expr;
-		Statement statement;
+		Block body;
 
-		public Foreach (Expression type, LocalVariableReference var, Expression expr,
-				Statement stmt, Location l)
+		public Foreach (Expression type, LocalVariable var, Expression expr, Statement stmt, Block body, Location l)
+			: base (stmt)
 		{
 			this.type = type;
 			this.variable = var;
 			this.expr = expr;
-			statement = stmt;
+			this.body = body;
 			loc = l;
 		}
 
-		public Statement Statement {
-			get { return statement; }
+		public Expression Expr {
+			get { return expr; }
+		}
+
+		public Expression TypeExpression {
+			get { return type; }
+		}
+
+		public LocalVariable Variable {
+			get { return variable; }
+		}
+
+		public override Reachability MarkReachable (Reachability rc)
+		{
+			base.MarkReachable (rc);
+
+			body.MarkReachable (rc);
+
+			return rc;
 		}
 
 		public override bool Resolve (BlockContext ec)
@@ -5874,10 +8057,12 @@ namespace Mono.CSharp {
 				return false;
 			}
 
-			if (expr.Type == TypeManager.string_type) {
-				statement = new ArrayForeach (this, 1);
-			} else if (expr.Type.IsArray) {
-				statement = new ArrayForeach (this, expr.Type.GetArrayRank ());
+			body.AddStatement (Statement);
+
+			if (expr.Type.BuiltinType == BuiltinTypeSpec.Type.String) {
+				Statement = new ArrayForeach (this, 1);
+			} else if (expr.Type is ArrayContainer) {
+				Statement = new ArrayForeach (this, ((ArrayContainer) expr.Type).Rank);
 			} else {
 				if (expr.eclass == ExprClass.MethodGroup || expr is AnonymousMethodExpression) {
 					ec.Report.Error (446, expr.Location, "Foreach statement cannot operate on a `{0}'",
@@ -5885,24 +8070,40 @@ namespace Mono.CSharp {
 					return false;
 				}
 
-				statement = new CollectionForeach (type, variable, expr, statement, loc);
+				Statement = new CollectionForeach (this, variable, expr);
 			}
 
-			return statement.Resolve (ec);
+			return base.Resolve (ec);
 		}
 
 		protected override void DoEmit (EmitContext ec)
 		{
-			ILGenerator ig = ec.ig;
-
 			Label old_begin = ec.LoopBegin, old_end = ec.LoopEnd;
-			ec.LoopBegin = ig.DefineLabel ();
-			ec.LoopEnd = ig.DefineLabel ();
+			ec.LoopBegin = ec.DefineLabel ();
+			ec.LoopEnd = ec.DefineLabel ();
 
-			statement.Emit (ec);
+			if (!(Statement is Block))
+				ec.BeginCompilerScope ();
+
+			variable.CreateBuilder (ec);
+
+			Statement.Emit (ec);
+
+			if (!(Statement is Block))
+				ec.EndScope ();
 
 			ec.LoopBegin = old_begin;
 			ec.LoopEnd = old_end;
+		}
+
+		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
+		{
+			expr.FlowAnalysis (fc);
+
+			var da = fc.BranchDefiniteAssignment ();
+			body.FlowAnalysis (fc);
+			fc.DefiniteAssignment = da;
+			return false;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -5910,14 +8111,14 @@ namespace Mono.CSharp {
 			Foreach target = (Foreach) t;
 
 			target.type = type.Clone (clonectx);
-			target.variable = variable.Clone (clonectx);
 			target.expr = expr.Clone (clonectx);
-			target.statement = statement.Clone (clonectx);
+			target.body = (Block) body.Clone (clonectx);
+			target.Statement = Statement.Clone (clonectx);
 		}
-
-		public override void MutateHoistedGenericType (AnonymousMethodStorey storey)
+		
+		public override object Accept (StructuralVisitor visitor)
 		{
-			statement.MutateHoistedGenericType (storey);
+			return visitor.Visit (this);
 		}
 	}
 }

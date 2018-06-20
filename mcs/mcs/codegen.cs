@@ -1,397 +1,58 @@
 //
 // codegen.cs: The code generator
 //
-// Author:
+// Authors:
 //   Miguel de Icaza (miguel@ximian.com)
+//   Marek Safar (marek.safar@gmail.com)
 //
 // Copyright 2001, 2002, 2003 Ximian, Inc.
 // Copyright 2004 Novell, Inc.
+// Copyright 2011 Xamarin Inc
 //
-
-//
-// Please leave this defined on SVN: The idea is that when we ship the
-// compiler to end users, if the compiler crashes, they have a chance
-// to narrow down the problem.   
-//
-// Only remove it if you need to debug locally on your tree.
-//
-//#define PRODUCTION
 
 using System;
-using System.IO;
-using System.Collections;
-using System.Collections.Specialized;
-using System.Globalization;
+using System.Collections.Generic;
+using Mono.CompilerServices.SymbolWriter;
+
+#if STATIC
+using MetaType = IKVM.Reflection.Type;
+using IKVM.Reflection;
+using IKVM.Reflection.Emit;
+#else
+using MetaType = System.Type;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Runtime.InteropServices;
-using System.Security;
-using System.Security.Cryptography;
-using System.Security.Permissions;
-
-using Mono.Security.Cryptography;
-
-namespace Mono.CSharp {
-
-	/// <summary>
-	///    Code generator class.
-	/// </summary>
-	public class CodeGen {
-		static AppDomain current_domain;
-
-		public static AssemblyClass Assembly;
-
-		static CodeGen ()
-		{
-			Reset ();
-		}
-
-		public static void Reset ()
-		{
-			Assembly = new AssemblyClass ();
-		}
-
-		public static string Basename (string name)
-		{
-			int pos = name.LastIndexOf ('/');
-
-			if (pos != -1)
-				return name.Substring (pos + 1);
-
-			pos = name.LastIndexOf ('\\');
-			if (pos != -1)
-				return name.Substring (pos + 1);
-
-			return name;
-		}
-
-		public static string Dirname (string name)
-		{
-			int pos = name.LastIndexOf ('/');
-
-			if (pos != -1)
-				return name.Substring (0, pos);
-
-			pos = name.LastIndexOf ('\\');
-			if (pos != -1)
-				return name.Substring (0, pos);
-
-			return ".";
-		}
-
-		static public string FileName;
-
-#if MS_COMPATIBLE
-		const AssemblyBuilderAccess COMPILER_ACCESS = 0;
-#else
-		/* Keep this in sync with System.Reflection.Emit.AssemblyBuilder */
-		const AssemblyBuilderAccess COMPILER_ACCESS = (AssemblyBuilderAccess) 0x800;
 #endif
-				
-		//
-		// Initializes the code generator variables for interactive use (repl)
-		//
-		static public void InitDynamic (CompilerContext ctx, string name)
-		{
-			current_domain = AppDomain.CurrentDomain;
-			AssemblyName an = Assembly.GetAssemblyName (name, name);
-			
-			Assembly.Builder = current_domain.DefineDynamicAssembly (an, AssemblyBuilderAccess.Run | COMPILER_ACCESS);
-			RootContext.ToplevelTypes = new ModuleContainer (ctx, true);
-			RootContext.ToplevelTypes.Builder = Assembly.Builder.DefineDynamicModule (Basename (name), false);
-			Assembly.Name = Assembly.Builder.GetName ();
-		}
-		
-		//
-		// Initializes the code generator variables
-		//
-		static public bool Init (string name, string output, bool want_debugging_support, CompilerContext ctx)
-		{
-			FileName = output;
-			AssemblyName an = Assembly.GetAssemblyName (name, output);
-			if (an == null)
-				return false;
 
-			if (an.KeyPair != null) {
-				// If we are going to strong name our assembly make
-				// sure all its refs are strong named
-				foreach (Assembly a in GlobalRootNamespace.Instance.Assemblies) {
-					AssemblyName ref_name = a.GetName ();
-					byte [] b = ref_name.GetPublicKeyToken ();
-					if (b == null || b.Length == 0) {
-						ctx.Report.Error (1577, "Assembly generation failed " +
-								"-- Referenced assembly '" +
-								ref_name.Name +
-								"' does not have a strong name.");
-						//Environment.Exit (1);
-					}
-				}
-			}
-			
-			current_domain = AppDomain.CurrentDomain;
-
-			try {
-				Assembly.Builder = current_domain.DefineDynamicAssembly (an,
-					AssemblyBuilderAccess.RunAndSave | COMPILER_ACCESS, Dirname (name));
-			}
-			catch (ArgumentException) {
-				// specified key may not be exportable outside it's container
-				if (RootContext.StrongNameKeyContainer != null) {
-					ctx.Report.Error (1548, "Could not access the key inside the container `" +
-						RootContext.StrongNameKeyContainer + "'.");
-					Environment.Exit (1);
-				}
-				throw;
-			}
-			catch (CryptographicException) {
-				if ((RootContext.StrongNameKeyContainer != null) || (RootContext.StrongNameKeyFile != null)) {
-					ctx.Report.Error (1548, "Could not use the specified key to strongname the assembly.");
-					Environment.Exit (1);
-				}
-				return false;
-			}
-
-			// Get the complete AssemblyName from the builder
-			// (We need to get the public key and token)
-			Assembly.Name = Assembly.Builder.GetName ();
-
-			//
-			// Pass a path-less name to DefineDynamicModule.  Wonder how
-			// this copes with output in different directories then.
-			// FIXME: figure out how this copes with --output /tmp/blah
-			//
-			// If the third argument is true, the ModuleBuilder will dynamically
-			// load the default symbol writer.
-			//
-			try {
-				RootContext.ToplevelTypes.Builder = Assembly.Builder.DefineDynamicModule (
-					Basename (name), Basename (output), want_debugging_support);
-
-#if !MS_COMPATIBLE
-				// TODO: We should use SymbolWriter from DefineDynamicModule
-				if (want_debugging_support && !SymbolWriter.Initialize (RootContext.ToplevelTypes.Builder, output)) {
-					ctx.Report.Error (40, "Unexpected debug information initialization error `{0}'",
-						"Could not find the symbol writer assembly (Mono.CompilerServices.SymbolWriter.dll)");
-					return false;
-				}
-#endif
-			} catch (ExecutionEngineException e) {
-				ctx.Report.Error (40, "Unexpected debug information initialization error `{0}'",
-					e.Message);
-				return false;
-			}
-
-			return true;
-		}
-
-		static public void Save (string name, bool saveDebugInfo, Report Report)
-		{
-#if GMCS_SOURCE
-			PortableExecutableKinds pekind;
-			ImageFileMachine machine;
-
-			switch (RootContext.Platform) {
-			case Platform.X86:
-				pekind = PortableExecutableKinds.Required32Bit;
-				machine = ImageFileMachine.I386;
-				break;
-			case Platform.X64:
-				pekind = PortableExecutableKinds.PE32Plus;
-				machine = ImageFileMachine.AMD64;
-				break;
-			case Platform.IA64:
-				pekind = PortableExecutableKinds.PE32Plus;
-				machine = ImageFileMachine.IA64;
-				break;
-			case Platform.AnyCPU:
-			default:
-				pekind = PortableExecutableKinds.ILOnly;
-				machine = ImageFileMachine.I386;
-				break;
-			}
-#endif
-			try {
-#if GMCS_SOURCE
-				Assembly.Builder.Save (Basename (name), pekind, machine);
-#else
-				Assembly.Builder.Save (Basename (name));
-#endif
-			}
-			catch (COMException) {
-				if ((RootContext.StrongNameKeyFile == null) || (!RootContext.StrongNameDelaySign))
-					throw;
-
-				// FIXME: it seems Microsoft AssemblyBuilder doesn't like to delay sign assemblies 
-				Report.Error (1548, "Couldn't delay-sign the assembly with the '" +
-					RootContext.StrongNameKeyFile +
-					"', Use MCS with the Mono runtime or CSC to compile this assembly.");
-			}
-			catch (System.IO.IOException io) {
-				Report.Error (16, "Could not write to file `"+name+"', cause: " + io.Message);
-				return;
-			}
-			catch (System.UnauthorizedAccessException ua) {
-				Report.Error (16, "Could not write to file `"+name+"', cause: " + ua.Message);
-				return;
-			}
-			catch (System.NotImplementedException nie) {
-				Report.RuntimeMissingSupport (Location.Null, nie.Message);
-				return;
-			}
-
-			//
-			// Write debuger symbol file
-			//
-			if (saveDebugInfo)
-				SymbolWriter.WriteSymbolFile ();
-			}
-	}
-
+namespace Mono.CSharp
+{
 	/// <summary>
 	///   An Emit Context is created for each body of code (from methods,
 	///   properties bodies, indexer bodies or constructor bodies)
 	/// </summary>
 	public class EmitContext : BuilderContext
 	{
-		public ILGenerator ig;
+		// TODO: Has to be private
+		public readonly ILGenerator ig;
 
 		/// <summary>
 		///   The value that is allowed to be returned or NULL if there is no
 		///   return type.
 		/// </summary>
-		Type return_type;
+		readonly TypeSpec return_type;
 
 		/// <summary>
 		///   Keeps track of the Type to LocalBuilder temporary storage created
 		///   to store structures (used to compute the address of the structure
 		///   value on structure method invocations)
 		/// </summary>
-		Hashtable temporary_storage;
+		Dictionary<TypeSpec, object> temporary_storage;
 
 		/// <summary>
 		///   The location where we store the return value.
 		/// </summary>
 		public LocalBuilder return_value;
 
-		/// <summary>
-		///   The location where return has to jump to return the
-		///   value
-		/// </summary>
-		public Label ReturnLabel;
-
-		/// <summary>
-		///   If we already defined the ReturnLabel
-		/// </summary>
-		public bool HasReturnLabel;
-
-		/// <summary>
-		///  Whether we are inside an anonymous method.
-		/// </summary>
-		public AnonymousExpression CurrentAnonymousMethod;
-		
-		public readonly IMemberContext MemberContext;
-
-		public EmitContext (IMemberContext rc, ILGenerator ig, Type return_type)
-		{
-			this.MemberContext = rc;
-			this.ig = ig;
-
-			this.return_type = return_type;
-		}
-
-		public Type CurrentType {
-			get { return MemberContext.CurrentType; }
-		}
-
-		public TypeParameter[] CurrentTypeParameters {
-			get { return MemberContext.CurrentTypeParameters; }
-		}
-
-		public TypeContainer CurrentTypeDefinition {
-			get { return MemberContext.CurrentTypeDefinition; }
-		}
-
-		public bool IsStatic {
-			get { return MemberContext.IsStatic; }
-		}
-
-		public Type ReturnType {
-			get {
-				return return_type;
-			}
-		}
-
-		/// <summary>
-		///   This is called immediately before emitting an IL opcode to tell the symbol
-		///   writer to which source line this opcode belongs.
-		/// </summary>
-		public void Mark (Location loc)
-		{
-			if (!SymbolWriter.HasSymbolWriter || HasSet (Options.OmitDebugInfo) || loc.IsNull)
-				return;
-
-			SymbolWriter.MarkSequencePoint (ig, loc);
-		}
-
-		public void DefineLocalVariable (string name, LocalBuilder builder)
-		{
-			SymbolWriter.DefineLocalVariable (name, builder);
-		}
-
-		public void BeginScope ()
-		{
-			ig.BeginScope();
-			SymbolWriter.OpenScope(ig);
-		}
-
-		public void EndScope ()
-		{
-			ig.EndScope();
-			SymbolWriter.CloseScope(ig);
-		}
-
-		/// <summary>
-		///   Returns a temporary storage for a variable of type t as 
-		///   a local variable in the current body.
-		/// </summary>
-		public LocalBuilder GetTemporaryLocal (Type t)
-		{
-			if (temporary_storage != null) {
-				object o = temporary_storage [t];
-				if (o != null) {
-					if (o is Stack) {
-						Stack s = (Stack) o;
-						o = s.Count == 0 ? null : s.Pop ();
-					} else {
-						temporary_storage.Remove (t);
-					}
-				}
-				if (o != null)
-					return (LocalBuilder) o;
-			}
-			return ig.DeclareLocal (t);
-		}
-
-		public void FreeTemporaryLocal (LocalBuilder b, Type t)
-		{
-			if (temporary_storage == null) {
-				temporary_storage = new Hashtable ();
-				temporary_storage [t] = b;
-				return;
-			}
-			object o = temporary_storage [t];
-			if (o == null) {
-				temporary_storage [t] = b;
-				return;
-			}
-			Stack s = o as Stack;
-			if (s == null) {
-				s = new Stack ();
-				s.Push (o);
-				temporary_storage [t] = s;
-			}
-			s.Push (b);
-		}
 
 		/// <summary>
 		///   Current loop begin and end labels.
@@ -410,6 +71,898 @@ namespace Mono.CSharp {
 		public Switch Switch;
 
 		/// <summary>
+		///  Whether we are inside an anonymous method.
+		/// </summary>
+		public AnonymousExpression CurrentAnonymousMethod;
+		
+		readonly IMemberContext member_context;
+
+		readonly SourceMethodBuilder methodSymbols;
+
+		DynamicSiteClass dynamic_site_container;
+
+		Label? return_label;
+
+		List<IExpressionCleanup> epilogue_expressions;
+
+		public EmitContext (IMemberContext rc, ILGenerator ig, TypeSpec return_type, SourceMethodBuilder methodSymbols)
+		{
+			this.member_context = rc;
+			this.ig = ig;
+			this.return_type = return_type;
+
+			if (rc.Module.Compiler.Settings.Checked)
+				flags |= Options.CheckedScope;
+
+			if (methodSymbols != null) {
+				this.methodSymbols = methodSymbols;
+				if (!rc.Module.Compiler.Settings.Optimize)
+					flags |= Options.AccurateDebugInfo;
+			} else {
+				flags |= Options.OmitDebugInfo;
+			}
+
+#if STATIC
+			ig.__CleverExceptionBlockAssistance ();
+#endif
+		}
+
+		#region Properties
+
+		internal AsyncTaskStorey AsyncTaskStorey {
+			get {
+				return CurrentAnonymousMethod.Storey as AsyncTaskStorey;
+			}
+		}
+
+		public BuiltinTypes BuiltinTypes {
+			get {
+				return MemberContext.Module.Compiler.BuiltinTypes;
+			}
+		}
+
+		public ConditionalAccessContext ConditionalAccess { get; set; }
+
+		public TypeSpec CurrentType {
+			get { return member_context.CurrentType; }
+		}
+
+		public TypeParameters CurrentTypeParameters {
+		    get { return member_context.CurrentTypeParameters; }
+		}
+
+		public MemberCore CurrentTypeDefinition {
+			get { return member_context.CurrentMemberDefinition; }
+		}
+
+		public bool EmitAccurateDebugInfo {
+			get {
+				return (flags & Options.AccurateDebugInfo) != 0;
+			}
+		}
+
+		public bool HasMethodSymbolBuilder {
+			get {
+				return methodSymbols != null;
+			}
+		}
+
+		public bool HasReturnLabel {
+			get {
+				return return_label.HasValue;
+			}
+		}
+
+		public bool IsStatic {
+			get { return member_context.IsStatic; }
+		}
+
+		public bool IsStaticConstructor {
+			get {
+				return member_context.IsStatic && (flags & Options.ConstructorScope) != 0;
+			}
+		}
+
+		public bool IsAnonymousStoreyMutateRequired {
+			get {
+				return CurrentAnonymousMethod != null &&
+					CurrentAnonymousMethod.Storey != null &&
+					CurrentAnonymousMethod.Storey.Mutator != null;
+			}
+		}
+
+		public IMemberContext MemberContext {
+			get {
+				return member_context;
+			}
+		}
+
+		public ModuleContainer Module {
+			get {
+				return member_context.Module;
+			}
+		}
+
+		public bool NotifyEvaluatorOnStore {
+			get {
+				return Module.Evaluator != null && Module.Evaluator.ModificationListener != null;
+			}
+		}
+
+		// Has to be used for specific emitter errors only any
+		// possible resolver errors have to be reported during Resolve
+		public Report Report {
+			get {
+				return member_context.Module.Compiler.Report;
+			}
+		}
+
+		public TypeSpec ReturnType {
+			get {
+				return return_type;
+			}
+		}
+
+		//
+		// The label where we have to jump before leaving the context
+		//
+		public Label ReturnLabel {
+			get {
+				return return_label.Value;
+			}
+		}
+
+		public List<IExpressionCleanup> StatementEpilogue {
+			get {
+				return epilogue_expressions;
+			}
+		}
+
+		public LocalVariable AsyncThrowVariable { get; set; }
+
+		public List<TryFinally> TryFinallyUnwind { get; set; }
+
+		public Label RecursivePatternLabel { get; set; }
+
+		#endregion
+
+		public void AddStatementEpilog (IExpressionCleanup cleanupExpression)
+		{
+			if (epilogue_expressions == null) {
+				epilogue_expressions = new List<IExpressionCleanup> ();
+			} else if (epilogue_expressions.Contains (cleanupExpression)) {
+				return;
+			}
+
+			epilogue_expressions.Add (cleanupExpression);
+		}
+
+		public void AssertEmptyStack ()
+		{
+#if STATIC
+			if (ig.__StackHeight != 0)
+				throw new InternalErrorException ("Await yields with non-empty stack in `{0}",
+					member_context.GetSignatureForError ());
+#endif
+		}
+
+		/// <summary>
+		///   This is called immediately before emitting an IL opcode to tell the symbol
+		///   writer to which source line this opcode belongs.
+		/// </summary>
+		public bool Mark (Location loc)
+		{
+			if ((flags & Options.OmitDebugInfo) != 0)
+				return false;
+
+			if (loc.IsNull || methodSymbols == null)
+				return false;
+
+			var sf = loc.SourceFile;
+			if (sf.IsHiddenLocation (loc))
+				return false;
+
+#if NET_4_0
+			methodSymbols.MarkSequencePoint (ig.ILOffset, sf.SourceFileEntry, loc.Row, loc.Column, false);
+#endif
+			return true;
+		}
+
+		public void MarkCallEntry (Location loc)
+		{
+			if (!EmitAccurateDebugInfo)
+				return;
+
+			//
+			// TODO: This should emit different kind of sequence point to make
+			// step-over work for statement over multiple lines
+			//
+			// Debugging experience for Foo (A () + B ()) where A and B are
+			// on separate lines is not great
+			//
+			Mark (loc);
+		}
+
+		public void DefineLocalVariable (string name, LocalBuilder builder)
+		{
+			if ((flags & Options.OmitDebugInfo) != 0)
+				return;
+
+			methodSymbols.AddLocal (builder.LocalIndex, name);
+		}
+
+		public void BeginCatchBlock (TypeSpec type)
+		{
+			if (IsAnonymousStoreyMutateRequired)
+				type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+			ig.BeginCatchBlock (type.GetMetaInfo ());
+		}
+
+		public void BeginFilterHandler ()
+		{
+			ig.BeginCatchBlock (null);
+		}
+
+		public void BeginExceptionBlock ()
+		{
+			ig.BeginExceptionBlock ();
+		}
+
+		public void BeginExceptionFilterBlock ()
+		{
+			ig.BeginExceptFilterBlock ();
+		}
+
+		public void BeginFinallyBlock ()
+		{
+			ig.BeginFinallyBlock ();
+		}
+
+		public void BeginScope ()
+		{
+			if ((flags & Options.OmitDebugInfo) != 0)
+				return;
+
+#if NET_4_0
+			methodSymbols.StartBlock (CodeBlockEntry.Type.Lexical, ig.ILOffset);
+#endif
+		}
+
+		public void BeginCompilerScope ()
+		{
+			if ((flags & Options.OmitDebugInfo) != 0)
+				return;
+
+#if NET_4_0
+			methodSymbols.StartBlock (CodeBlockEntry.Type.CompilerGenerated, ig.ILOffset);
+#endif
+		}
+
+		public void EndExceptionBlock ()
+		{
+			ig.EndExceptionBlock ();
+		}
+
+		public void EndScope ()
+		{
+			if ((flags & Options.OmitDebugInfo) != 0)
+				return;
+
+#if NET_4_0
+			methodSymbols.EndBlock (ig.ILOffset);
+#endif
+		}
+
+		public void CloseConditionalAccess (TypeSpec type)
+		{
+			if (type != null)
+				Emit (OpCodes.Newobj, Nullable.NullableInfo.GetConstructor (type));
+
+			MarkLabel (ConditionalAccess.EndLabel);
+			ConditionalAccess = null;
+		}
+
+		//
+		// Creates a nested container in this context for all dynamic compiler generated stuff
+		//
+		internal DynamicSiteClass CreateDynamicSite ()
+		{
+			if (dynamic_site_container == null) {
+				var mc = member_context.CurrentMemberDefinition as MemberBase;
+				dynamic_site_container = new DynamicSiteClass (CurrentTypeDefinition.Parent.PartialContainer, mc, member_context.CurrentTypeParameters);
+
+				CurrentTypeDefinition.Module.AddCompilerGeneratedClass (dynamic_site_container);
+				dynamic_site_container.CreateContainer ();
+				dynamic_site_container.DefineContainer ();
+				dynamic_site_container.Define ();
+
+				var inflator = new TypeParameterInflator (Module, CurrentType, TypeParameterSpec.EmptyTypes, TypeSpec.EmptyTypes);
+				var inflated = dynamic_site_container.CurrentType.InflateMember (inflator);
+				CurrentType.MemberCache.AddMember (inflated);
+			}
+
+			return dynamic_site_container;
+		}
+
+		public Label CreateReturnLabel ()
+		{
+			if (!return_label.HasValue)
+				return_label = DefineLabel ();
+
+			return return_label.Value;
+		}
+
+		public LocalBuilder DeclareLocal (TypeSpec type, bool pinned)
+		{
+			if (IsAnonymousStoreyMutateRequired)
+				type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+			return ig.DeclareLocal (type.GetMetaInfo (), pinned);
+		}
+
+		public Label DefineLabel ()
+		{
+			return ig.DefineLabel ();
+		}
+
+		//
+		// Creates temporary field in current async storey
+		//
+		public StackFieldExpr GetTemporaryField (TypeSpec type, bool initializedFieldRequired = false)
+		{
+			var f = AsyncTaskStorey.AddCapturedLocalVariable (type, initializedFieldRequired);
+			var fexpr = new StackFieldExpr (f);
+			fexpr.InstanceExpression = new CompilerGeneratedThis (CurrentType, Location.Null);
+			return fexpr;
+		}
+
+		public void MarkLabel (Label label)
+		{
+			ig.MarkLabel (label);
+		}
+
+		public void Emit (OpCode opcode)
+		{
+			ig.Emit (opcode);
+		}
+
+		public void Emit (OpCode opcode, LocalBuilder local)
+		{
+			ig.Emit (opcode, local);
+		}
+
+		public void Emit (OpCode opcode, string arg)
+		{
+			ig.Emit (opcode, arg);
+		}
+
+		public void Emit (OpCode opcode, double arg)
+		{
+			ig.Emit (opcode, arg);
+		}
+
+		public void Emit (OpCode opcode, float arg)
+		{
+			ig.Emit (opcode, arg);
+		}
+
+		public void Emit (OpCode opcode, Label label)
+		{
+			ig.Emit (opcode, label);
+		}
+
+		public void Emit (OpCode opcode, Label[] labels)
+		{
+			ig.Emit (opcode, labels);
+		}
+
+		public void Emit (OpCode opcode, TypeSpec type)
+		{
+			if (IsAnonymousStoreyMutateRequired)
+				type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+			ig.Emit (opcode, type.GetMetaInfo ());
+		}
+
+		public void Emit (OpCode opcode, FieldSpec field)
+		{
+			if (IsAnonymousStoreyMutateRequired)
+				field = field.Mutate (CurrentAnonymousMethod.Storey.Mutator);
+
+			ig.Emit (opcode, field.GetMetaInfo ());
+		}
+
+		public void Emit (OpCode opcode, MethodSpec method)
+		{
+			if (IsAnonymousStoreyMutateRequired)
+				method = method.Mutate (CurrentAnonymousMethod.Storey.Mutator);
+
+			if (method.IsConstructor)
+				ig.Emit (opcode, (ConstructorInfo) method.GetMetaInfo ());
+			else
+				ig.Emit (opcode, (MethodInfo) method.GetMetaInfo ());
+		}
+
+		// TODO: REMOVE breaks mutator
+		public void Emit (OpCode opcode, MethodInfo method)
+		{
+			ig.Emit (opcode, method);
+		}
+
+		public void Emit (OpCode opcode, MethodSpec method, MetaType[] vargs)
+		{
+			// TODO MemberCache: This should mutate too
+			ig.EmitCall (opcode, (MethodInfo) method.GetMetaInfo (), vargs);
+		}
+
+		public void EmitArrayNew (ArrayContainer ac)
+		{
+			if (ac.Rank == 1) {
+				var type = IsAnonymousStoreyMutateRequired ?
+					CurrentAnonymousMethod.Storey.Mutator.Mutate (ac.Element) :
+					ac.Element;
+
+				ig.Emit (OpCodes.Newarr, type.GetMetaInfo ());
+			} else {
+				if (IsAnonymousStoreyMutateRequired)
+					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
+
+				ig.Emit (OpCodes.Newobj, ac.GetConstructor ());
+			}
+		}
+
+		public void EmitArrayAddress (ArrayContainer ac)
+		{
+			if (ac.Rank > 1) {
+				if (IsAnonymousStoreyMutateRequired)
+					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
+
+				ig.Emit (OpCodes.Call, ac.GetAddressMethod ());
+			} else {
+				var type = IsAnonymousStoreyMutateRequired ?
+					CurrentAnonymousMethod.Storey.Mutator.Mutate (ac.Element) :
+					ac.Element;
+
+				ig.Emit (OpCodes.Ldelema, type.GetMetaInfo ());
+			}
+		}
+
+		//
+		// Emits the right opcode to load from an array
+		//
+		public void EmitArrayLoad (ArrayContainer ac)
+		{
+			if (ac.Rank > 1) {
+				if (IsAnonymousStoreyMutateRequired)
+					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
+
+				ig.Emit (OpCodes.Call, ac.GetGetMethod ());
+				return;
+			}
+
+
+			var type = ac.Element;
+			if (type.Kind == MemberKind.Enum)
+				type = EnumSpec.GetUnderlyingType (type);
+
+			switch (type.BuiltinType) {
+			case BuiltinTypeSpec.Type.Bool:
+				//
+				// bool array can actually store any byte value in underlying byte slot
+				// and C# spec does not specify any normalization rule, except the result
+				// is undefined
+				//
+			case BuiltinTypeSpec.Type.Byte:
+				ig.Emit (OpCodes.Ldelem_U1);
+				break;
+			case BuiltinTypeSpec.Type.SByte:
+				ig.Emit (OpCodes.Ldelem_I1);
+				break;
+			case BuiltinTypeSpec.Type.Short:
+				ig.Emit (OpCodes.Ldelem_I2);
+				break;
+			case BuiltinTypeSpec.Type.UShort:
+			case BuiltinTypeSpec.Type.Char:
+				ig.Emit (OpCodes.Ldelem_U2);
+				break;
+			case BuiltinTypeSpec.Type.Int:
+				ig.Emit (OpCodes.Ldelem_I4);
+				break;
+			case BuiltinTypeSpec.Type.UInt:
+				ig.Emit (OpCodes.Ldelem_U4);
+				break;
+			case BuiltinTypeSpec.Type.ULong:
+			case BuiltinTypeSpec.Type.Long:
+				ig.Emit (OpCodes.Ldelem_I8);
+				break;
+			case BuiltinTypeSpec.Type.Float:
+				ig.Emit (OpCodes.Ldelem_R4);
+				break;
+			case BuiltinTypeSpec.Type.Double:
+				ig.Emit (OpCodes.Ldelem_R8);
+				break;
+			case BuiltinTypeSpec.Type.IntPtr:
+				ig.Emit (OpCodes.Ldelem_I);
+				break;
+			default:
+				switch (type.Kind) {
+				case MemberKind.Struct:
+					if (IsAnonymousStoreyMutateRequired)
+						type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+					ig.Emit (OpCodes.Ldelema, type.GetMetaInfo ());
+					ig.Emit (OpCodes.Ldobj, type.GetMetaInfo ());
+					break;
+				case MemberKind.TypeParameter:
+					if (IsAnonymousStoreyMutateRequired)
+						type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+					ig.Emit (OpCodes.Ldelem, type.GetMetaInfo ());
+					break;
+				case MemberKind.PointerType:
+					ig.Emit (OpCodes.Ldelem_I);
+					break;
+				default:
+					ig.Emit (OpCodes.Ldelem_Ref);
+					break;
+				}
+				break;
+			}
+		}
+
+		//
+		// Emits the right opcode to store to an array
+		//
+		public void EmitArrayStore (ArrayContainer ac)
+		{
+			if (ac.Rank > 1) {
+				if (IsAnonymousStoreyMutateRequired)
+					ac = (ArrayContainer) ac.Mutate (CurrentAnonymousMethod.Storey.Mutator);
+
+				ig.Emit (OpCodes.Call, ac.GetSetMethod ());
+				return;
+			}
+
+			var type = ac.Element;
+
+			if (type.Kind == MemberKind.Enum)
+				type = EnumSpec.GetUnderlyingType (type);
+
+			switch (type.BuiltinType) {
+			case BuiltinTypeSpec.Type.Byte:
+			case BuiltinTypeSpec.Type.SByte:
+			case BuiltinTypeSpec.Type.Bool:
+				Emit (OpCodes.Stelem_I1);
+				return;
+			case BuiltinTypeSpec.Type.Short:
+			case BuiltinTypeSpec.Type.UShort:
+			case BuiltinTypeSpec.Type.Char:
+				Emit (OpCodes.Stelem_I2);
+				return;
+			case BuiltinTypeSpec.Type.Int:
+			case BuiltinTypeSpec.Type.UInt:
+				Emit (OpCodes.Stelem_I4);
+				return;
+			case BuiltinTypeSpec.Type.Long:
+			case BuiltinTypeSpec.Type.ULong:
+				Emit (OpCodes.Stelem_I8);
+				return;
+			case BuiltinTypeSpec.Type.Float:
+				Emit (OpCodes.Stelem_R4);
+				return;
+			case BuiltinTypeSpec.Type.Double:
+				Emit (OpCodes.Stelem_R8);
+				return;
+			}
+
+			switch (type.Kind) {
+			case MemberKind.Struct:
+				Emit (OpCodes.Stobj, type);
+				break;
+			case MemberKind.TypeParameter:
+				Emit (OpCodes.Stelem, type);
+				break;
+			case MemberKind.PointerType:
+				Emit (OpCodes.Stelem_I);
+				break;
+			default:
+				Emit (OpCodes.Stelem_Ref);
+				break;
+			}
+		}
+
+		public void EmitInt (int i)
+		{
+			EmitIntConstant (i);
+		}
+
+		void EmitIntConstant (int i)
+		{
+			switch (i) {
+			case -1:
+				ig.Emit (OpCodes.Ldc_I4_M1);
+				break;
+
+			case 0:
+				ig.Emit (OpCodes.Ldc_I4_0);
+				break;
+
+			case 1:
+				ig.Emit (OpCodes.Ldc_I4_1);
+				break;
+
+			case 2:
+				ig.Emit (OpCodes.Ldc_I4_2);
+				break;
+
+			case 3:
+				ig.Emit (OpCodes.Ldc_I4_3);
+				break;
+
+			case 4:
+				ig.Emit (OpCodes.Ldc_I4_4);
+				break;
+
+			case 5:
+				ig.Emit (OpCodes.Ldc_I4_5);
+				break;
+
+			case 6:
+				ig.Emit (OpCodes.Ldc_I4_6);
+				break;
+
+			case 7:
+				ig.Emit (OpCodes.Ldc_I4_7);
+				break;
+
+			case 8:
+				ig.Emit (OpCodes.Ldc_I4_8);
+				break;
+
+			default:
+				if (i >= -128 && i <= 127) {
+					ig.Emit (OpCodes.Ldc_I4_S, (sbyte) i);
+				} else
+					ig.Emit (OpCodes.Ldc_I4, i);
+				break;
+			}
+		}
+
+		public void EmitLong (long l)
+		{
+			if (l >= int.MinValue && l <= int.MaxValue) {
+				EmitIntConstant (unchecked ((int) l));
+				ig.Emit (OpCodes.Conv_I8);
+			} else if (l >= 0 && l <= uint.MaxValue) {
+				EmitIntConstant (unchecked ((int) l));
+				ig.Emit (OpCodes.Conv_U8);
+			} else {
+				ig.Emit (OpCodes.Ldc_I8, l);
+			}
+		}
+
+		//
+		// Load the object from the pointer.  
+		//
+		public void EmitLoadFromPtr (TypeSpec type)
+		{
+			if (type.Kind == MemberKind.Enum)
+				type = EnumSpec.GetUnderlyingType (type);
+
+			switch (type.BuiltinType) {
+			case BuiltinTypeSpec.Type.Int:
+				ig.Emit (OpCodes.Ldind_I4);
+				break;
+			case BuiltinTypeSpec.Type.UInt:
+				ig.Emit (OpCodes.Ldind_U4);
+				break;
+			case BuiltinTypeSpec.Type.Short:
+				ig.Emit (OpCodes.Ldind_I2);
+				break;
+			case BuiltinTypeSpec.Type.UShort:
+			case BuiltinTypeSpec.Type.Char:
+				ig.Emit (OpCodes.Ldind_U2);
+				break;
+			case BuiltinTypeSpec.Type.Byte:
+				ig.Emit (OpCodes.Ldind_U1);
+				break;
+			case BuiltinTypeSpec.Type.SByte:
+			case BuiltinTypeSpec.Type.Bool:
+				ig.Emit (OpCodes.Ldind_I1);
+				break;
+			case BuiltinTypeSpec.Type.ULong:
+			case BuiltinTypeSpec.Type.Long:
+				ig.Emit (OpCodes.Ldind_I8);
+				break;
+			case BuiltinTypeSpec.Type.Float:
+				ig.Emit (OpCodes.Ldind_R4);
+				break;
+			case BuiltinTypeSpec.Type.Double:
+				ig.Emit (OpCodes.Ldind_R8);
+				break;
+			case BuiltinTypeSpec.Type.IntPtr:
+				ig.Emit (OpCodes.Ldind_I);
+				break;
+			default:
+				switch (type.Kind) {
+				case MemberKind.Struct:
+				case MemberKind.TypeParameter:
+					if (IsAnonymousStoreyMutateRequired)
+						type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+					ig.Emit (OpCodes.Ldobj, type.GetMetaInfo ());
+					break;
+				case MemberKind.PointerType:
+					ig.Emit (OpCodes.Ldind_I);
+					break;
+				default:
+					ig.Emit (OpCodes.Ldind_Ref);
+					break;
+				}
+				break;
+			}
+		}
+
+		public void EmitNull ()
+		{
+			ig.Emit (OpCodes.Ldnull);
+		}
+
+		public void EmitArgumentAddress (int pos)
+		{
+			if (!IsStatic)
+				++pos;
+
+			if (pos > byte.MaxValue)
+				ig.Emit (OpCodes.Ldarga, pos);
+			else
+				ig.Emit (OpCodes.Ldarga_S, (byte) pos);
+		}
+
+		public void EmitArgumentLoad (int pos)
+		{
+			if (!IsStatic)
+				++pos;
+
+			switch (pos) {
+			case 0: ig.Emit (OpCodes.Ldarg_0); break;
+			case 1: ig.Emit (OpCodes.Ldarg_1); break;
+			case 2: ig.Emit (OpCodes.Ldarg_2); break;
+			case 3: ig.Emit (OpCodes.Ldarg_3); break;
+			default:
+				if (pos > byte.MaxValue)
+					ig.Emit (OpCodes.Ldarg, pos);
+				else
+					ig.Emit (OpCodes.Ldarg_S, (byte) pos);
+				break;
+			}
+		}
+
+		public void EmitArgumentStore (int pos)
+		{
+			if (!IsStatic)
+				++pos;
+
+			if (pos > byte.MaxValue)
+				ig.Emit (OpCodes.Starg, pos);
+			else
+				ig.Emit (OpCodes.Starg_S, (byte) pos);
+		}
+
+		//
+		// The stack contains the pointer and the value of type `type'
+		//
+		public void EmitStoreFromPtr (TypeSpec type)
+		{
+			if (type.IsEnum)
+				type = EnumSpec.GetUnderlyingType (type);
+
+			switch (type.BuiltinType) {
+			case BuiltinTypeSpec.Type.Int:
+			case BuiltinTypeSpec.Type.UInt:
+				ig.Emit (OpCodes.Stind_I4);
+				return;
+			case BuiltinTypeSpec.Type.Long:
+			case BuiltinTypeSpec.Type.ULong:
+				ig.Emit (OpCodes.Stind_I8);
+				return;
+			case BuiltinTypeSpec.Type.Char:
+			case BuiltinTypeSpec.Type.Short:
+			case BuiltinTypeSpec.Type.UShort:
+				ig.Emit (OpCodes.Stind_I2);
+				return;
+			case BuiltinTypeSpec.Type.Float:
+				ig.Emit (OpCodes.Stind_R4);
+				return;
+			case BuiltinTypeSpec.Type.Double:
+				ig.Emit (OpCodes.Stind_R8);
+				return;
+			case BuiltinTypeSpec.Type.Byte:
+			case BuiltinTypeSpec.Type.SByte:
+			case BuiltinTypeSpec.Type.Bool:
+				ig.Emit (OpCodes.Stind_I1);
+				return;
+			case BuiltinTypeSpec.Type.IntPtr:
+				ig.Emit (OpCodes.Stind_I);
+				return;
+			}
+
+			switch (type.Kind) {
+			case MemberKind.Struct:
+			case MemberKind.TypeParameter:
+				if (IsAnonymousStoreyMutateRequired)
+					type = CurrentAnonymousMethod.Storey.Mutator.Mutate (type);
+
+				ig.Emit (OpCodes.Stobj, type.GetMetaInfo ());
+				break;
+			default:
+				ig.Emit (OpCodes.Stind_Ref);
+				break;
+			}
+		}
+
+		public void EmitThis ()
+		{
+			ig.Emit (OpCodes.Ldarg_0);
+		}
+
+		public void EmitEpilogue ()
+		{
+			if (epilogue_expressions == null)
+				return;
+
+			foreach (var e in epilogue_expressions)
+				e.EmitCleanup (this);
+
+			epilogue_expressions = null;
+		}
+
+		/// <summary>
+		///   Returns a temporary storage for a variable of type t as 
+		///   a local variable in the current body.
+		/// </summary>
+		public LocalBuilder GetTemporaryLocal (TypeSpec t)
+		{
+			if (temporary_storage != null) {
+				object o;
+				if (temporary_storage.TryGetValue (t, out o)) {
+					if (o is Stack<LocalBuilder>) {
+						var s = (Stack<LocalBuilder>) o;
+						o = s.Count == 0 ? null : s.Pop ();
+					} else {
+						temporary_storage.Remove (t);
+					}
+				}
+				if (o != null)
+					return (LocalBuilder) o;
+			}
+			return DeclareLocal (t, false);
+		}
+
+		public void FreeTemporaryLocal (LocalBuilder b, TypeSpec t)
+		{
+			if (temporary_storage == null) {
+				temporary_storage = new Dictionary<TypeSpec, object> (ReferenceEquality<TypeSpec>.Default);
+				temporary_storage.Add (t, b);
+				return;
+			}
+			object o;
+			
+			if (!temporary_storage.TryGetValue (t, out o)) {
+				temporary_storage.Add (t, b);
+				return;
+			}
+			var s = o as Stack<LocalBuilder>;
+			if (s == null) {
+				s = new Stack<LocalBuilder> ();
+				s.Push ((LocalBuilder)o);
+				temporary_storage [t] = s;
+			}
+			s.Push (b);
+		}
+
+		/// <summary>
 		///   ReturnValue creates on demand the LocalBuilder for the
 		///   return value from the function.  By default this is not
 		///   used.  This is only required when returns are found inside
@@ -424,575 +977,390 @@ namespace Mono.CSharp {
 		public LocalBuilder TemporaryReturn ()
 		{
 			if (return_value == null){
-				return_value = ig.DeclareLocal (return_type);
-				if (!HasReturnLabel){
-					ReturnLabel = ig.DefineLabel ();
-					HasReturnLabel = true;
-				}
+				return_value = DeclareLocal (return_type, false);
 			}
 
 			return return_value;
 		}
 	}
 
-	public abstract class CommonAssemblyModulClass : Attributable, IMemberContext
+	public class ConditionalAccessContext
 	{
-		public void AddAttributes (ArrayList attrs, IMemberContext context)
+		public ConditionalAccessContext (TypeSpec type, Label endLabel)
 		{
-			foreach (Attribute a in attrs)
-				a.AttachTo (this, context);
-
-			if (attributes == null) {
-				attributes = new Attributes (attrs);
-				return;
-			}
-			attributes.AddAttributes (attrs);
+			Type = type;
+			EndLabel = endLabel;
 		}
 
-		public virtual void Emit (TypeContainer tc) 
-		{
-			if (OptAttributes == null)
-				return;
-
-			OptAttributes.Emit ();
-		}
-
-		protected Attribute ResolveAttribute (PredefinedAttribute a_type)
-		{
-			Attribute a = OptAttributes.Search (a_type);
-			if (a != null) {
-				a.Resolve ();
-			}
-			return a;
-		}
-
-		#region IMemberContext Members
-
-		public CompilerContext Compiler {
-			get { return RootContext.ToplevelTypes.Compiler; }
-		}
-
-		public Type CurrentType {
-			get { return null; }
-		}
-
-		public TypeParameter[] CurrentTypeParameters {
-			get { return null; }
-		}
-
-		public TypeContainer CurrentTypeDefinition {
-			get { return RootContext.ToplevelTypes; }
-		}
-
-		public string GetSignatureForError ()
-		{
-			return "<module>";
-		}
-
-		public bool IsObsolete {
-			get { return false; }
-		}
-
-		public bool IsUnsafe {
-			get { return false; }
-		}
-
-		public bool IsStatic {
-			get { return false; }
-		}
-
-		public ExtensionMethodGroupExpr LookupExtensionMethod (Type extensionType, string name, Location loc)
-		{
-			throw new NotImplementedException ();
-		}
-
-		public FullNamedExpression LookupNamespaceOrType (string name, Location loc, bool ignore_cs0104)
-		{
-			return RootContext.ToplevelTypes.LookupNamespaceOrType (name, loc, ignore_cs0104);
-		}
-
-		public FullNamedExpression LookupNamespaceAlias (string name)
-		{
-			return null;
-		}
-
-		#endregion
+		public bool Statement { get; set; }
+		public Label EndLabel { get; private set; }
+		public TypeSpec Type { get; private set; }
 	}
-                
-	public class AssemblyClass : CommonAssemblyModulClass {
-		// TODO: make it private and move all builder based methods here
-		public AssemblyBuilder Builder;
-		bool is_cls_compliant;
-		bool wrap_non_exception_throws;
 
-		public Attribute ClsCompliantAttribute;
+	struct CallEmitter
+	{
+		public Expression InstanceExpression;
 
-		ListDictionary declarative_security;
-		bool has_extension_method;		
-		public AssemblyName Name;
-		MethodInfo add_type_forwarder;
-		ListDictionary emitted_forwarders;
+		//
+		// When call has to leave an extra copy of all arguments on the stack
+		//
+		public bool DuplicateArguments;
 
-		// Module is here just because of error messages
-		static string[] attribute_targets = new string [] { "assembly", "module" };
+		//
+		// Does not emit InstanceExpression load when InstanceExpressionOnStack
+		// is set. Used by compound assignments.
+		//
+		public bool InstanceExpressionOnStack;
 
-		public AssemblyClass ()
+		//
+		// Any of arguments contains await expression
+		//
+		public bool HasAwaitArguments;
+
+		public bool ConditionalAccess;
+
+		//
+		// When dealing with await arguments the original arguments are converted
+		// into a new set with hoisted stack results
+		//
+		public Arguments EmittedArguments;
+
+		public void Emit (EmitContext ec, MethodSpec method, Arguments Arguments, Location loc)
 		{
-			wrap_non_exception_throws = true;
+			EmitPredefined (ec, method, Arguments, false, loc);
 		}
 
-		public bool HasExtensionMethods {
-			set {
-				has_extension_method = value;
-			}
-		}
-
-		public bool IsClsCompliant {
-			get {
-				return is_cls_compliant;
-			}
-		}
-
-		public bool WrapNonExceptionThrows {
-			get {
-				return wrap_non_exception_throws;
-			}
-		}
-
-		public override AttributeTargets AttributeTargets {
-			get {
-				return AttributeTargets.Assembly;
-			}
-		}
-
-		public override bool IsClsComplianceRequired ()
+		public void EmitStatement (EmitContext ec, MethodSpec method, Arguments Arguments, Location loc)
 		{
-			return is_cls_compliant;
+			EmitPredefined (ec, method, Arguments, true, loc);
 		}
 
-		Report Report {
-			get { return Compiler.Report; }
-		}
-
-		public void Resolve ()
+		public void EmitPredefined (EmitContext ec, MethodSpec method, Arguments Arguments, bool statement = false, Location? loc = null)
 		{
-			if (RootContext.Unsafe) {
+			Expression instance_copy = null;
+
+			if (!HasAwaitArguments && ec.HasSet (BuilderContext.Options.AsyncBody)) {
+				HasAwaitArguments = Arguments != null && Arguments.ContainsEmitWithAwait ();
+				if (HasAwaitArguments && InstanceExpressionOnStack) {
+					throw new NotSupportedException ();
+				}
+			}
+
+			OpCode call_op;
+			LocalTemporary lt = null;
+
+			if (method.IsStatic) {
+				call_op = OpCodes.Call;
+			} else {
+				call_op = IsVirtualCallRequired (InstanceExpression, method) ? OpCodes.Callvirt : OpCodes.Call;
+
+				if (HasAwaitArguments) {
+					instance_copy = InstanceExpression.EmitToField (ec);
+					var ie = new InstanceEmitter (instance_copy, IsAddressCall (instance_copy, call_op, method.DeclaringType));
+
+					if (Arguments == null) {
+						ie.EmitLoad (ec, true);
+					}
+				} else if (!InstanceExpressionOnStack) {
+					var ie = new InstanceEmitter (InstanceExpression, IsAddressCall (InstanceExpression, call_op, method.DeclaringType));
+					ie.Emit (ec, ConditionalAccess);
+
+					if (DuplicateArguments) {
+						ec.Emit (OpCodes.Dup);
+						if (Arguments != null && Arguments.Count != 0) {
+							lt = new LocalTemporary (ie.GetStackType (ec));
+							lt.Store (ec);
+							instance_copy = lt;
+						}
+					}
+				}
+			}
+
+			if (Arguments != null && !InstanceExpressionOnStack) {
+				EmittedArguments = Arguments.Emit (ec, DuplicateArguments, HasAwaitArguments);
+				if (EmittedArguments != null) {
+					if (instance_copy != null) {
+						var ie = new InstanceEmitter (instance_copy, IsAddressCall (instance_copy, call_op, method.DeclaringType));
+						ie.Emit (ec, ConditionalAccess);
+
+						if (lt != null)
+							lt.Release (ec);
+					}
+
+					EmittedArguments.Emit (ec);
+				}
+			}
+
+			if (call_op == OpCodes.Callvirt && (InstanceExpression.Type.IsGenericParameter || InstanceExpression.Type.IsStructOrEnum)) {
+				ec.Emit (OpCodes.Constrained, InstanceExpression.Type);
+			}
+
+			if (loc != null) {
 				//
-				// Emits [assembly: SecurityPermissionAttribute (SecurityAction.RequestMinimum, SkipVerification = true)]
-				// when -unsafe option was specified
+				// Emit explicit sequence point for expressions like Foo.Bar () to help debugger to
+				// break at right place when LHS expression can be stepped-into
 				//
-				
-				Location loc = Location.Null;
-
-				MemberAccess system_security_permissions = new MemberAccess (new MemberAccess (
-					new QualifiedAliasMember (QualifiedAliasMember.GlobalAlias, "System", loc), "Security", loc), "Permissions", loc);
-
-				Arguments pos = new Arguments (1);
-				pos.Add (new Argument (new MemberAccess (new MemberAccess (system_security_permissions, "SecurityAction", loc), "RequestMinimum")));
-
-				Arguments named = new Arguments (1);
-				named.Add (new NamedArgument (new LocatedToken (loc, "SkipVerification"), (new BoolLiteral (true, loc))));
-
-				GlobalAttribute g = new GlobalAttribute (new NamespaceEntry (null, null, null), "assembly",
-					new MemberAccess (system_security_permissions, "SecurityPermissionAttribute"),
-					new Arguments[] { pos, named }, loc, false);
-				g.AttachTo (this, this);
-
-				if (g.Resolve () != null) {
-					declarative_security = new ListDictionary ();
-					g.ExtractSecurityPermissionSet (declarative_security);
-				}
+				ec.MarkCallEntry (loc.Value);
 			}
 
-			if (OptAttributes == null)
-				return;
+			//
+			// Set instance expression to actual result expression. When it contains await it can be
+			// picked up by caller
+			//
+			InstanceExpression = instance_copy;
 
-			// Ensure that we only have GlobalAttributes, since the Search isn't safe with other types.
-			if (!OptAttributes.CheckTargets())
-				return;
-
-			ClsCompliantAttribute = ResolveAttribute (PredefinedAttributes.Get.CLSCompliant);
-
-			if (ClsCompliantAttribute != null) {
-				is_cls_compliant = ClsCompliantAttribute.GetClsCompliantAttributeValue ();
+			if (method.Parameters.HasArglist) {
+				var varargs_types = GetVarargsTypes (method, Arguments);
+				ec.Emit (call_op, method, varargs_types);
+			} else {
+				//
+				// If you have:
+				// this.DoFoo ();
+				// and DoFoo is not virtual, you can omit the callvirt,
+				// because you don't need the null checking behavior.
+				//
+				ec.Emit (call_op, method);
 			}
 
-			Attribute a = ResolveAttribute (PredefinedAttributes.Get.RuntimeCompatibility);
-			if (a != null) {
-				object val = a.GetPropertyValue ("WrapNonExceptionThrows");
-				if (val != null)
-					wrap_non_exception_throws = (bool) val;
-			}
+			// 
+			// Pop the return value if there is one and stack should be empty
+			//
+			if (statement && method.ReturnType.Kind != MemberKind.Void)
+				ec.Emit (OpCodes.Pop);
 		}
 
-		// fix bug #56621
-		private void SetPublicKey (AssemblyName an, byte[] strongNameBlob) 
+		static MetaType[] GetVarargsTypes (MethodSpec method, Arguments arguments)
 		{
-			try {
-				// check for possible ECMA key
-				if (strongNameBlob.Length == 16) {
-					// will be rejected if not "the" ECMA key
-					an.SetPublicKey (strongNameBlob);
-				}
-				else {
-					// take it, with or without, a private key
-					RSA rsa = CryptoConvert.FromCapiKeyBlob (strongNameBlob);
-					// and make sure we only feed the public part to Sys.Ref
-					byte[] publickey = CryptoConvert.ToCapiPublicKeyBlob (rsa);
-					
-					// AssemblyName.SetPublicKey requires an additional header
-					byte[] publicKeyHeader = new byte [12] { 0x00, 0x24, 0x00, 0x00, 0x04, 0x80, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00 };
+			AParametersCollection pd = method.Parameters;
 
-					byte[] encodedPublicKey = new byte [12 + publickey.Length];
-					Buffer.BlockCopy (publicKeyHeader, 0, encodedPublicKey, 0, 12);
-					Buffer.BlockCopy (publickey, 0, encodedPublicKey, 12, publickey.Length);
-					an.SetPublicKey (encodedPublicKey);
-				}
-			}
-			catch (Exception) {
-				Error_AssemblySigning ("The specified file `" + RootContext.StrongNameKeyFile + "' is incorrectly encoded");
-				Environment.Exit (1);
-			}
+			Argument a = arguments[pd.Count - 1];
+			Arglist list = (Arglist) a.Expr;
+
+			return list.ArgumentTypes;
 		}
 
-		// TODO: rewrite this code (to kill N bugs and make it faster) and use standard ApplyAttribute way.
-		public AssemblyName GetAssemblyName (string name, string output) 
+		//
+		// Used to decide whether call or callvirt is needed
+		//
+		static bool IsVirtualCallRequired (Expression instance, MethodSpec method)
 		{
-			if (OptAttributes != null) {
-				foreach (Attribute a in OptAttributes.Attrs) {
-					// cannot rely on any resolve-based members before you call Resolve
-					if (a.ExplicitTarget == null || a.ExplicitTarget != "assembly")
-						continue;
-
-					// TODO: This code is buggy: comparing Attribute name without resolving is wrong.
-					//       However, this is invoked by CodeGen.Init, when none of the namespaces
-					//       are loaded yet.
-					// TODO: Does not handle quoted attributes properly
-					switch (a.Name) {
-					case "AssemblyKeyFile":
-					case "AssemblyKeyFileAttribute":
-					case "System.Reflection.AssemblyKeyFileAttribute":
-						if (RootContext.StrongNameKeyFile != null) {
-							Report.SymbolRelatedToPreviousError (a.Location, a.GetSignatureForError ());
-							Report.Warning (1616, 1, "Option `{0}' overrides attribute `{1}' given in a source file or added module",
-									"keyfile", "System.Reflection.AssemblyKeyFileAttribute");
-						} else {
-							string value = a.GetString ();
-							if (value != null && value.Length != 0)
-								RootContext.StrongNameKeyFile = value;
-						}
-						break;
-					case "AssemblyKeyName":
-					case "AssemblyKeyNameAttribute":
-					case "System.Reflection.AssemblyKeyNameAttribute":
-						if (RootContext.StrongNameKeyContainer != null) {
-							Report.SymbolRelatedToPreviousError (a.Location, a.GetSignatureForError ());
-							Report.Warning (1616, 1, "Option `{0}' overrides attribute `{1}' given in a source file or added module",
-									"keycontainer", "System.Reflection.AssemblyKeyNameAttribute");
-						} else {
-							string value = a.GetString ();
-							if (value != null && value.Length != 0)
-								RootContext.StrongNameKeyContainer = value;
-						}
-						break;
-					case "AssemblyDelaySign":
-					case "AssemblyDelaySignAttribute":
-					case "System.Reflection.AssemblyDelaySignAttribute":
-						RootContext.StrongNameDelaySign = a.GetBoolean ();
-						break;
-					}
-				}
-			}
-			
-			AssemblyName an = new AssemblyName ();
-			an.Name = Path.GetFileNameWithoutExtension (name);
-
-			// note: delay doesn't apply when using a key container
-			if (RootContext.StrongNameKeyContainer != null) {
-				an.KeyPair = new StrongNameKeyPair (RootContext.StrongNameKeyContainer);
-				return an;
-			}
-
-			// strongname is optional
-			if (RootContext.StrongNameKeyFile == null)
-				return an;
-
-			string AssemblyDir = Path.GetDirectoryName (output);
-
-			// the StrongName key file may be relative to (a) the compiled
-			// file or (b) to the output assembly. See bugzilla #55320
-			// http://bugzilla.ximian.com/show_bug.cgi?id=55320
-
-			// (a) relative to the compiled file
-			string filename = Path.GetFullPath (RootContext.StrongNameKeyFile);
-			bool exist = File.Exists (filename);
-			if ((!exist) && (AssemblyDir != null) && (AssemblyDir != String.Empty)) {
-				// (b) relative to the outputed assembly
-				filename = Path.GetFullPath (Path.Combine (AssemblyDir, RootContext.StrongNameKeyFile));
-				exist = File.Exists (filename);
-			}
-
-			if (exist) {
-				using (FileStream fs = new FileStream (filename, FileMode.Open, FileAccess.Read)) {
-					byte[] snkeypair = new byte [fs.Length];
-					fs.Read (snkeypair, 0, snkeypair.Length);
-
-					if (RootContext.StrongNameDelaySign) {
-						// delayed signing - DO NOT include private key
-						SetPublicKey (an, snkeypair);
-					}
-					else {
-						// no delay so we make sure we have the private key
-						try {
-							CryptoConvert.FromCapiPrivateKeyBlob (snkeypair);
-							an.KeyPair = new StrongNameKeyPair (snkeypair);
-						}
-						catch (CryptographicException) {
-							if (snkeypair.Length == 16) {
-								// error # is different for ECMA key
-								Report.Error (1606, "Could not sign the assembly. " + 
-									"ECMA key can only be used to delay-sign assemblies");
-							}
-							else {
-								Error_AssemblySigning ("The specified file `" + RootContext.StrongNameKeyFile + "' does not have a private key");
-							}
-							return null;
-						}
-					}
-				}
-			}
-			else {
-				Error_AssemblySigning ("The specified file `" + RootContext.StrongNameKeyFile + "' does not exist");
-				return null;
-			}
-			return an;
-		}
-
-		void Error_AssemblySigning (string text)
-		{
-			Report.Error (1548, "Error during assembly signing. " + text);
-		}
-
-		bool CheckInternalsVisibleAttribute (Attribute a)
-		{
-			string assembly_name = a.GetString ();
-			if (assembly_name.Length == 0)
+			//
+			// There are 2 scenarious where we emit callvirt
+			//
+			// Case 1: A method is virtual and it's not used to call base
+			// Case 2: A method instance expression can be null. In this casen callvirt ensures
+			// correct NRE exception when the method is called
+			//
+			var decl_type = method.DeclaringType;
+			if (decl_type.IsStruct || decl_type.IsEnum)
 				return false;
-				
-			AssemblyName aname = null;
-			try {
-#if GMCS_SOURCE
-				aname = new AssemblyName (assembly_name);
-#else
-				throw new NotSupportedException ();
-#endif
-			} catch (FileLoadException) {
-			} catch (ArgumentException) {
-			}
-				
-			// Bad assembly name format
-			if (aname == null)
-				Report.Warning (1700, 3, a.Location, "Assembly reference `" + assembly_name + "' is invalid and cannot be resolved");
-			// Report error if we have defined Version or Culture
-			else if (aname.Version != null || aname.CultureInfo != null)
-				throw new Exception ("Friend assembly `" + a.GetString () + 
-						"' is invalid. InternalsVisibleTo cannot have version or culture specified.");
-			else if (aname.GetPublicKey () == null && Name.GetPublicKey () != null && Name.GetPublicKey ().Length != 0) {
-				Report.Error (1726, a.Location, "Friend assembly reference `" + aname.FullName + "' is invalid." +
-						" Strong named assemblies must specify a public key in their InternalsVisibleTo declarations");
+
+			if (instance is BaseThis)
 				return false;
-			}
+
+			//
+			// It's non-virtual and will never be null and it can be determined
+			// whether it's known value or reference type by verifier
+			//
+			if (!method.IsVirtual && Expression.IsNeverNull (instance) && !instance.Type.IsGenericParameter)
+				return false;
 
 			return true;
 		}
 
-		static bool IsValidAssemblyVersion (string version)
+		static bool IsAddressCall (Expression instance, OpCode callOpcode, TypeSpec declaringType)
 		{
-			Version v;
-			try {
-				v = new Version (version);
-			} catch {
-				try {
-					int major = int.Parse (version, CultureInfo.InvariantCulture);
-					v = new Version (major, 0);
-				} catch {
-					return false;
-				}
-			}
+			var instance_type = instance.Type;
+			return (instance_type.IsStructOrEnum && (callOpcode == OpCodes.Callvirt || (callOpcode == OpCodes.Call && declaringType.IsStruct))) ||
+				instance_type.IsGenericParameter || declaringType.IsNullableType;
+		}
+	}
 
-			foreach (int candidate in new int [] { v.Major, v.Minor, v.Build, v.Revision }) {
-				if (candidate > ushort.MaxValue)
-					return false;
-			}
+	public struct InstanceEmitter
+	{
+		readonly Expression instance;
+		readonly bool addressRequired;
 
-			return true;
+		public InstanceEmitter (Expression instance, bool addressLoad)
+		{
+			this.instance = instance;
+			this.addressRequired = addressLoad;
 		}
 
-		public override void ApplyAttributeBuilder (Attribute a, CustomAttributeBuilder cb, PredefinedAttributes pa)
+		public void Emit (EmitContext ec, bool conditionalAccess)
 		{
-			if (a.IsValidSecurityAttribute ()) {
-				if (declarative_security == null)
-					declarative_security = new ListDictionary ();
+			Label NullOperatorLabel;
+			Nullable.Unwrap unwrap;
 
-				a.ExtractSecurityPermissionSet (declarative_security);
-				return;
+			if (conditionalAccess && Expression.IsNeverNull (instance))
+				conditionalAccess = false;
+
+			if (conditionalAccess) {
+				NullOperatorLabel = ec.DefineLabel ();
+				unwrap = instance as Nullable.Unwrap;
+			} else {
+				NullOperatorLabel = new Label ();
+				unwrap = null;
 			}
 
-			if (a.Type == pa.AssemblyCulture) {
-				string value = a.GetString ();
-				if (value == null || value.Length == 0)
-					return;
+			IMemoryLocation instance_address = null;
+			bool conditional_access_dup = false;
 
-				if (RootContext.Target == Target.Exe) {
-					a.Error_AttributeEmitError ("The executables cannot be satelite assemblies, remove the attribute or keep it empty");
-					return;
-				}
-			}
+			if (unwrap != null) {
+				unwrap.Store (ec);
+				unwrap.EmitCheck (ec);
+				ec.Emit (OpCodes.Brtrue_S, NullOperatorLabel);
+			} else {
+				if (conditionalAccess && addressRequired) {
+					//
+					// Don't allocate temp variable when instance load is cheap and load and load-address
+					// operate on same memory
+					//
+					instance_address = instance as VariableReference;
+					if (instance_address == null)
+						instance_address = instance as LocalTemporary;
 
-			if (a.Type == pa.AssemblyVersion) {
-				string value = a.GetString ();
-				if (value == null || value.Length == 0)
-					return;
+					if (instance_address == null) {
+						EmitLoad (ec, false);
+						ec.Emit (OpCodes.Dup);
+						ec.EmitLoadFromPtr (instance.Type);
 
-				value = value.Replace ('*', '0');
+						conditional_access_dup = true;
+					} else {
+						instance.Emit (ec);
+					}
+				} else {
+					EmitLoad (ec, !conditionalAccess);
 
-				if (!IsValidAssemblyVersion (value)) {
-					a.Error_AttributeEmitError (string.Format ("Specified version `{0}' is not valid", value));
-					return;
-				}
-			}
-
-			if (a.Type == pa.InternalsVisibleTo && !CheckInternalsVisibleAttribute (a))
-				return;
-
-			if (a.Type == pa.TypeForwarder) {
-				Type t = a.GetArgumentType ();
-				if (t == null || TypeManager.HasElementType (t)) {
-					Report.Error (735, a.Location, "Invalid type specified as an argument for TypeForwardedTo attribute");
-					return;
-				}
-
-				t = TypeManager.DropGenericTypeArguments (t);
-				if (emitted_forwarders == null) {
-					emitted_forwarders = new ListDictionary();
-				} else if (emitted_forwarders.Contains(t)) {
-					Report.SymbolRelatedToPreviousError(((Attribute)emitted_forwarders[t]).Location, null);
-					Report.Error(739, a.Location, "A duplicate type forward of type `{0}'",
-						TypeManager.CSharpName(t));
-					return;
-				}
-
-				emitted_forwarders.Add(t, a);
-
-				if (TypeManager.LookupDeclSpace (t) != null) {
-					Report.SymbolRelatedToPreviousError (t);
-					Report.Error (729, a.Location, "Cannot forward type `{0}' because it is defined in this assembly",
-						TypeManager.CSharpName (t));
-					return;
-				}
-
-				if (t.DeclaringType != null) {
-					Report.Error (730, a.Location, "Cannot forward type `{0}' because it is a nested type",
-						TypeManager.CSharpName (t));
-					return;
-				}
-
-				if (add_type_forwarder == null) {
-					add_type_forwarder = typeof (AssemblyBuilder).GetMethod ("AddTypeForwarder",
-						BindingFlags.NonPublic | BindingFlags.Instance);
-
-					if (add_type_forwarder == null) {
-						Report.RuntimeMissingSupport (a.Location, "TypeForwardedTo attribute");
-						return;
+					if (conditionalAccess) {
+						conditional_access_dup = !IsInexpensiveLoad ();
+						if (conditional_access_dup)
+							ec.Emit (OpCodes.Dup);
 					}
 				}
 
-				add_type_forwarder.Invoke (Builder, new object[] { t });
-				return;
-			}
-			
-			if (a.Type == pa.Extension) {
-				a.Error_MisusedExtensionAttribute ();
-				return;
-			}
+				if (conditionalAccess) {
+					if (instance.Type.Kind == MemberKind.TypeParameter)
+						ec.Emit (OpCodes.Box, instance.Type);
 
-			Builder.SetCustomAttribute (cb);
-		}
+					ec.Emit (OpCodes.Brtrue_S, NullOperatorLabel);
 
-		public override void Emit (TypeContainer tc)
-		{
-			base.Emit (tc);
-
-			if (has_extension_method)
-				PredefinedAttributes.Get.Extension.EmitAttribute (Builder);
-
-			// FIXME: Does this belong inside SRE.AssemblyBuilder instead?
-			PredefinedAttribute pa = PredefinedAttributes.Get.RuntimeCompatibility;
-			if (pa.IsDefined && (OptAttributes == null || !OptAttributes.Contains (pa))) {
-				ConstructorInfo ci = TypeManager.GetPredefinedConstructor (
-					pa.Type, Location.Null, Type.EmptyTypes);
-				PropertyInfo [] pis = new PropertyInfo [1];
-				pis [0] = TypeManager.GetPredefinedProperty (pa.Type,
-					"WrapNonExceptionThrows", Location.Null, TypeManager.bool_type);
-				object [] pargs = new object [1];
-				pargs [0] = true;
-				Builder.SetCustomAttribute (new CustomAttributeBuilder (ci, new object [0], pis, pargs));
-			}
-
-			if (declarative_security != null) {
-
-				MethodInfo add_permission = typeof (AssemblyBuilder).GetMethod ("AddPermissionRequests", BindingFlags.Instance | BindingFlags.NonPublic);
-				object builder_instance = Builder;
-
-				try {
-					// Microsoft runtime hacking
-					if (add_permission == null) {
-						Type assembly_builder = typeof (AssemblyBuilder).Assembly.GetType ("System.Reflection.Emit.AssemblyBuilderData");
-						add_permission = assembly_builder.GetMethod ("AddPermissionRequests", BindingFlags.Instance | BindingFlags.NonPublic);
-
-						FieldInfo fi = typeof (AssemblyBuilder).GetField ("m_assemblyData", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.GetField);
-						builder_instance = fi.GetValue (Builder);
-					}
-
-					object[] args = new object [] { declarative_security [SecurityAction.RequestMinimum],
-												  declarative_security [SecurityAction.RequestOptional],
-												  declarative_security [SecurityAction.RequestRefuse] };
-					add_permission.Invoke (builder_instance, args);
+					if (conditional_access_dup)
+						ec.Emit (OpCodes.Pop);
 				}
-				catch {
-					Report.RuntimeMissingSupport (Location.Null, "assembly permission setting");
+			}
+
+			if (conditionalAccess) {
+				if (!ec.ConditionalAccess.Statement) {
+					if (ec.ConditionalAccess.Type.IsNullableType)
+						Nullable.LiftedNull.Create (ec.ConditionalAccess.Type, Location.Null).Emit (ec);
+					else
+						ec.EmitNull ();
+				}
+
+				ec.Emit (OpCodes.Br, ec.ConditionalAccess.EndLabel);
+				ec.MarkLabel (NullOperatorLabel);
+
+				if (instance_address != null) {
+					instance_address.AddressOf (ec, AddressOp.Load);
+				} else if (unwrap != null) {
+					unwrap.Emit (ec);
+					var tmp = ec.GetTemporaryLocal (unwrap.Type);
+					ec.Emit (OpCodes.Stloc, tmp);
+					ec.Emit (OpCodes.Ldloca, tmp);
+					ec.FreeTemporaryLocal (tmp, unwrap.Type);
+				} else if (!conditional_access_dup) {
+					instance.Emit (ec);
 				}
 			}
 		}
 
-		public override string[] ValidAttributeTargets {
-			get {
-				return attribute_targets;
-			}
-		}
-
-		// Wrapper for AssemblyBuilder.AddModule
-		static MethodInfo adder_method;
-		static public MethodInfo AddModule_Method {
-			get {
-				if (adder_method == null)
-					adder_method = typeof (AssemblyBuilder).GetMethod ("AddModule", BindingFlags.Instance|BindingFlags.NonPublic);
-				return adder_method;
-			}
-		}
-		public Module AddModule (string module)
+		public void EmitLoad (EmitContext ec, bool boxInstance)
 		{
-			MethodInfo m = AddModule_Method;
-			if (m == null) {
-				Report.RuntimeMissingSupport (Location.Null, "/addmodule");
-				Environment.Exit (1);
+			var instance_type = instance.Type;
+
+			//
+			// Push the instance expression
+			//
+			if (addressRequired) {
+				//
+				// If the expression implements IMemoryLocation, then
+				// we can optimize and use AddressOf on the
+				// return.
+				//
+				// If not we have to use some temporary storage for
+				// it.
+				var iml = instance as IMemoryLocation;
+				if (iml != null) {
+					iml.AddressOf (ec, AddressOp.Load);
+				} else {
+					LocalTemporary temp = new LocalTemporary (instance_type);
+					instance.Emit (ec);
+					temp.Store (ec);
+					temp.AddressOf (ec, AddressOp.Load);
+				}
+
+				return;
 			}
 
-			try {
-				return (Module) m.Invoke (Builder, new object [] { module });
-			} catch (TargetInvocationException ex) {
-				throw ex.InnerException;
+			instance.Emit (ec);
+
+			// Only to make verifier happy
+			if (boxInstance && RequiresBoxing ()) {
+				ec.Emit (OpCodes.Box, instance_type);
 			}
-		}		
+		}
+
+		public TypeSpec GetStackType (EmitContext ec)
+		{
+			var instance_type = instance.Type;
+
+			if (addressRequired)
+				return ReferenceContainer.MakeType (ec.Module, instance_type);
+
+			if (instance_type.IsStructOrEnum)
+				return ec.Module.Compiler.BuiltinTypes.Object;
+
+			return instance_type;
+		}
+
+		bool RequiresBoxing ()
+		{
+			var instance_type = instance.Type;
+			if (instance_type.IsGenericParameter && !(instance is This) && TypeSpec.IsReferenceType (instance_type))
+				return true;
+
+			if (instance_type.IsStructOrEnum)
+				return true;
+
+			return false;
+		}
+
+		//
+		// Returns true for cheap race-free load, where we can avoid using dup
+		//
+		bool IsInexpensiveLoad ()
+		{
+			if (instance is Constant)
+				return instance.IsSideEffectFree;
+
+			if (RequiresBoxing ())
+				return false;
+
+			var vr = instance as VariableReference;
+			if (vr != null) {
+				// Load from captured local would be racy without dup
+				return !vr.IsRef && !vr.IsHoisted;
+			}
+
+			if (instance is LocalTemporary)
+				return true;
+
+			var fe = instance as FieldExpr;
+			if (fe != null)
+				return fe.IsStatic || fe.InstanceExpression is This;
+
+			return false;
+		}
 	}
 }
