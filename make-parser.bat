@@ -1,0 +1,1 @@
+mcs\jay\jay.exe -cv < mcs\jay\skeleton.cs mcs\mcs\cs-parser.jay > mcs\mcs\cs-parser.cs
